@@ -444,7 +444,9 @@ describe("SessionStore loadSessions preserves existing loaded state", () => {
 				agentId: "cursor",
 			}),
 		];
-		vi.mocked(api.scanSessions).mockReturnValue(okAsync(mockHistoryEntries));
+		vi.mocked(api.scanSessions).mockReturnValue(
+			okAsync({ entries: mockHistoryEntries, failedAgents: [] })
+		);
 
 		// Act: Run loadSessions (simulating what happens during initialization)
 		await store.loadSessions(["/test/path"]);
@@ -468,7 +470,9 @@ describe("SessionStore loadSessions preserves existing loaded state", () => {
 				agentId: "cursor",
 			}),
 		];
-		vi.mocked(api.scanSessions).mockReturnValue(okAsync(mockHistoryEntries));
+		vi.mocked(api.scanSessions).mockReturnValue(
+			okAsync({ entries: mockHistoryEntries, failedAgents: [] })
+		);
 
 		// Act: Run loadSessions
 		await store.loadSessions(["/test/path"]);

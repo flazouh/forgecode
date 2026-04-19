@@ -11,9 +11,10 @@ import type {
 	SessionOpenResult,
 	SessionProjectionSnapshot,
 } from "../../services/acp-types.js";
-import type { HistoryEntry, StartupSessionsResponse } from "../../services/claude-history-types";
+import type { StartupSessionsResponse } from "../../services/claude-history-types";
 import type { ConfigOptionData, ConvertedSession } from "../../services/converted-session-types.js";
 import { tauriClient } from "../../utils/tauri-client";
+import type { ScanProjectSessionsResponse } from "../../utils/tauri-client/types";
 import { AgentError, type AppError } from "../errors/app-error";
 import type { InteractionReplyRequest } from "../types/interaction-reply-request.js";
 import type { AgentAvailabilityKind, PersistedWorkspaceState, ResumeSessionResult } from "./types";
@@ -191,7 +192,9 @@ export function getSessionProjection(
  *
  * @param projectPaths - Array of project paths to scan for sessions.
  */
-export function scanSessions(projectPaths: string[]): ResultAsync<HistoryEntry[], AppError> {
+export function scanSessions(
+	projectPaths: string[]
+): ResultAsync<ScanProjectSessionsResponse, AppError> {
 	return tauriClient.history.scanProjectSessions(projectPaths);
 }
 
