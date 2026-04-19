@@ -1186,7 +1186,11 @@ mod session_metadata_tests {
         .await
         .unwrap();
 
-        assert_eq!(result.len(), 1, "only project-b external session should remain");
+        assert_eq!(
+            result.len(),
+            1,
+            "only project-b external session should remain"
+        );
         assert_eq!(result[0].id, "ext-b");
     }
 
