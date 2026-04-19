@@ -1378,6 +1378,14 @@ export function project_color(args: MessageArgs = {}): string {
 	return interpolate(`Color`, args);
 }
 
+export function project_show_external_cli_sessions(args: MessageArgs = {}): string {
+	return interpolate(`Show external CLI sessions`, args);
+}
+
+export function project_external_sessions_hidden_tooltip(args: MessageArgs = {}): string {
+	return interpolate(`External CLI sessions hidden — click to show`, args);
+}
+
 export function project_icon_change(args: MessageArgs = {}): string {
 	return interpolate(`Change icon...`, args);
 }
@@ -1459,6 +1467,10 @@ export function project_remove_confirm_description(args: MessageArgs = {}): stri
 		`Remove "{projectName}" from your workspace? This will not delete any files.`,
 		args
 	);
+}
+
+export function project_external_sessions_hidden_hint(args: MessageArgs = {}): string {
+	return interpolate(`No sessions to show.`, args);
 }
 
 export function panel_fullscreen(args: MessageArgs = {}): string {

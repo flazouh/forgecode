@@ -57,9 +57,13 @@ pub async fn get_session_history(app: AppHandle) -> CommandResult<Vec<HistoryEnt
         }
 
         // Query from SQLite index (fast path)
-        let indexed_sessions = SessionMetadataRepository::get_for_projects(&db, &project_paths)
-            .await
-            .map_err(|e| e.to_string())?;
+        let indexed_sessions = SessionMetadataRepository::get_for_projects(
+            &db,
+            &project_paths,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         if indexed_sessions.is_empty() {
             // Index might be empty (first run or corrupted)
