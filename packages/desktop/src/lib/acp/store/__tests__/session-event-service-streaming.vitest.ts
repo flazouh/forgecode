@@ -19,7 +19,7 @@ vi.mock("../utils/logger.js", () => ({
 	}),
 }));
 
-import type { TranscriptDelta } from "../../../services/acp-types.js";
+import type { SessionStateEnvelope, TranscriptDelta } from "../../../services/acp-types.js";
 import type { SessionUpdate } from "../../../services/converted-session-types.js";
 import type { SessionEntry } from "../../application/dto/session.js";
 import { SessionEntryStore } from "../session-entry-store.svelte.js";
@@ -52,7 +52,7 @@ function createMockHandler(): SessionEventHandler {
 		updateCurrentMode: vi.fn(),
 		updateConfigOptions: vi.fn(),
 		updateUsageTelemetry: vi.fn(),
-		applyTranscriptDelta: vi.fn(),
+		applySessionStateEnvelope: vi.fn(),
 	};
 }
 
@@ -216,7 +216,7 @@ describe("SessionEventService streaming delta handling", () => {
 		expect(handler.updateToolCallEntry).toHaveBeenCalledWith("session-123", update.update);
 	});
 
-	it("drops queued assistant fallback chunks when a transcript delta arrives first", async () => {
+	it("drops queued assistant fallback chunks when a canonical delta envelope arrives first", async () => {
 		const update: SessionUpdate = {
 			type: "agentMessageChunk",
 			session_id: "session-123",
@@ -250,14 +250,78 @@ describe("SessionEventService streaming delta handling", () => {
 			],
 		};
 
+		const envelope: SessionStateEnvelope = {
+			sessionId: "session-123",
+			graphRevision: 7,
+			lastEventSeq: 7,
+			payload: {
+				kind: "delta",
+				delta: {
+					fromRevision: { graphRevision: 6, transcriptRevision: 6, lastEventSeq: 6 },
+					toRevision: { graphRevision: 7, transcriptRevision: 7, lastEventSeq: 7 },
+					transcriptOperations: delta.operations,
+					changedFields: ["transcriptSnapshot"],
+				},
+			},
+		};
+
 		service.handleSessionUpdate(update, handler);
-		service.handleTranscriptDelta(delta, handler);
+		service.handleSessionStateEnvelope(envelope, handler);
 		await new Promise((resolve) => {
 			setTimeout(resolve, 0);
 		});
 
 		expect(handler.aggregateAssistantChunk).not.toHaveBeenCalled();
-		expect(handler.applyTranscriptDelta).toHaveBeenCalledWith("session-123", delta);
+		expect(handler.applySessionStateEnvelope).toHaveBeenCalledWith(
+			"session-123",
+			expect.objectContaining({
+				sessionId: "session-123",
+				graphRevision: 7,
+				lastEventSeq: 7,
+			})
+		);
+	});
+
+	it("routes session-state delta envelopes through the canonical transcript path", () => {
+		const delta: TranscriptDelta = {
+			eventSeq: 7,
+			sessionId: "session-123",
+			snapshotRevision: 7,
+			operations: [
+				{
+					kind: "appendEntry",
+					entry: {
+						entryId: "assistant-1",
+						role: "assistant",
+						segments: [
+							{
+								kind: "text",
+								segmentId: "assistant-1:segment:7",
+								text: "hello",
+							},
+						],
+					},
+				},
+			],
+		};
+		const envelope: SessionStateEnvelope = {
+			sessionId: "session-123",
+			graphRevision: 7,
+			lastEventSeq: 7,
+			payload: {
+				kind: "delta",
+				delta: {
+					fromRevision: { graphRevision: 6, transcriptRevision: 6, lastEventSeq: 6 },
+					toRevision: { graphRevision: 7, transcriptRevision: 7, lastEventSeq: 7 },
+					transcriptOperations: delta.operations,
+					changedFields: ["transcriptSnapshot"],
+				},
+			},
+		};
+
+		service.handleSessionStateEnvelope(envelope, handler);
+
+		expect(handler.applySessionStateEnvelope).toHaveBeenCalledWith("session-123", envelope);
 	});
 
 	it("falls back to assistant chunk aggregation when no transcript delta arrives", async () => {
@@ -284,7 +348,7 @@ describe("SessionEventService streaming delta handling", () => {
 			"assistant-1",
 			false
 		);
-		expect(handler.applyTranscriptDelta).not.toHaveBeenCalled();
+		expect(handler.applySessionStateEnvelope).not.toHaveBeenCalled();
 	});
 
 	it("routes non-empty streaming deltas through canonical tool updates", () => {
@@ -428,7 +492,7 @@ describe("SessionEventService streaming delta handling", () => {
 		);
 	});
 
-	it("treats a completed plan event as the end of an active turn", () => {
+	it("does not synthesize turn completion from a plan payload", () => {
 		markHandlerTurnAsStreaming(handler);
 		const update: SessionUpdate = {
 			type: "plan",
@@ -444,10 +508,10 @@ describe("SessionEventService streaming delta handling", () => {
 
 		service.handleSessionUpdate(update, handler);
 
-		expect(handler.handleStreamComplete).toHaveBeenCalledWith("session-123", null);
+		expect(handler.handleStreamComplete).not.toHaveBeenCalled();
 	});
 
-	it("does not complete the turn again for a completed plan when the turn is already done", () => {
+	it("still ignores plan payloads when the turn is already completed", () => {
 		markHandlerTurnAsCompleted(handler);
 		const update: SessionUpdate = {
 			type: "plan",
@@ -771,20 +835,7 @@ describe("SessionEventService streaming delta handling", () => {
 
 		service.handleSessionUpdate(update, handler);
 
-		expect(handler.updateToolCallEntry).toHaveBeenCalledWith("session-123", {
-			toolCallId: "tool-edit-1",
-			arguments: {
-				kind: "edit",
-				edits: [
-					{
-						filePath: "/tmp/example.ts",
-						oldString: "before",
-						newString: "after",
-						content: "after",
-					},
-				],
-			},
-		});
+		expect(handler.updateToolCallEntry).not.toHaveBeenCalled();
 		expect(onPermissionRequest).toHaveBeenCalledWith(
 			expect.objectContaining({
 				id: "perm-edit-1",
@@ -862,7 +913,7 @@ describe("SessionEventService streaming delta handling", () => {
 			updateCurrentMode: vi.fn(),
 			updateConfigOptions: vi.fn(),
 			updateUsageTelemetry: vi.fn(),
-			applyTranscriptDelta: vi.fn(),
+			applySessionStateEnvelope: vi.fn(),
 		};
 
 		service.handleSessionUpdate(
@@ -928,7 +979,7 @@ describe("SessionEventService streaming delta handling", () => {
 		expect(handler.aggregateUserChunk).toHaveBeenCalledWith("session-123", update.chunk);
 	});
 
-	it("buffers updates for disconnected sessions when not connecting", () => {
+	it("applies updates immediately for known sessions even when hot state says disconnected", () => {
 		const disconnectedHandler = createMockHandler();
 		const session = {
 			id: "session-123",
@@ -959,7 +1010,48 @@ describe("SessionEventService streaming delta handling", () => {
 
 		service.handleSessionUpdate(update, disconnectedHandler);
 
-		expect(disconnectedHandler.createToolCallEntry).not.toHaveBeenCalled();
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledWith(
+			"session-123",
+			update.tool_call
+		);
+	});
+
+	it("drops duplicate envelope-seq replays immediately for known disconnected sessions", () => {
+		const disconnectedHandler = createMockHandler();
+		const session = {
+			id: "session-123",
+			agentId: "claude-code",
+		} as unknown as SessionCold;
+		(disconnectedHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "idle",
+		});
+
+		const update: SessionUpdate = {
+			type: "toolCall",
+			session_id: "session-123",
+			tool_call: {
+				id: "tool-buffered-1",
+				name: "WebSearch",
+				status: "in_progress",
+				kind: "search",
+				arguments: {
+					kind: "search",
+					query: "canonical dedupe",
+				},
+				awaitingPlanApproval: false,
+			},
+		};
+
+		service.handleSessionUpdate(update, disconnectedHandler, 303);
+		service.handleSessionUpdate(update, disconnectedHandler, 303);
+
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledTimes(1);
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledWith(
+			"session-123",
+			update.tool_call
+		);
 	});
 
 	it("does not buffer permissionRequest updates for disconnected sessions", () => {
@@ -1087,6 +1179,104 @@ describe("SessionEventService streaming delta handling", () => {
 		);
 	});
 
+	it("[regression] does not suppress raw session updates while connecting", () => {
+		const reconnectingHandler = createMockHandler();
+		const session = {
+			id: "session-123",
+			agentId: "claude-code",
+		} as unknown as SessionCold;
+		(reconnectingHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(reconnectingHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "connecting",
+		});
+
+		const update: SessionUpdate = {
+			type: "toolCall",
+			session_id: "session-123",
+			tool_call: {
+				id: "tool-replay-connecting-1",
+				name: "Read",
+				status: "in_progress",
+				kind: "read",
+				arguments: {
+					kind: "read",
+					file_path: "/repo/src/replayed.ts",
+				},
+				awaitingPlanApproval: false,
+			},
+		};
+
+		service.handleSessionUpdate(update, reconnectingHandler, 500);
+
+		expect(reconnectingHandler.createToolCallEntry).toHaveBeenCalledWith(
+			"session-123",
+			update.tool_call
+		);
+	});
+
+	it("[regression] does not buffer transcript deltas while connecting", () => {
+		const reconnectingHandler = createMockHandler();
+		const session = {
+			id: "session-123",
+			agentId: "claude-code",
+		} as unknown as SessionCold;
+		(reconnectingHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(reconnectingHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "connecting",
+		});
+
+		const delta: TranscriptDelta = {
+			sessionId: "session-123",
+			eventSeq: 42,
+			snapshotRevision: 42,
+			operations: [
+				{
+					kind: "appendEntry",
+					entry: {
+						entryId: "assistant-42",
+						role: "assistant",
+						segments: [
+							{
+								kind: "text",
+								segmentId: "assistant-42:segment:42",
+								text: "post-snapshot delta",
+							},
+						],
+					},
+				},
+			],
+		};
+
+		const envelope: SessionStateEnvelope = {
+			sessionId: "session-123",
+			graphRevision: 42,
+			lastEventSeq: 42,
+			payload: {
+				kind: "delta",
+				delta: {
+					fromRevision: { graphRevision: 41, transcriptRevision: 41, lastEventSeq: 41 },
+					toRevision: { graphRevision: 42, transcriptRevision: 42, lastEventSeq: 42 },
+					transcriptOperations: delta.operations,
+					changedFields: ["transcriptSnapshot"],
+				},
+			},
+		};
+
+		service.handleSessionStateEnvelope(envelope, reconnectingHandler);
+
+		expect(reconnectingHandler.applySessionStateEnvelope).toHaveBeenCalledTimes(1);
+		expect(reconnectingHandler.applySessionStateEnvelope).toHaveBeenCalledWith(
+			"session-123",
+			expect.objectContaining({
+				sessionId: "session-123",
+				graphRevision: 42,
+				lastEventSeq: 42,
+			})
+		);
+	});
+
 	it("does not infer plan mode from enter_plan_mode tool calls", () => {
 		const update: SessionUpdate = {
 			type: "toolCall",
@@ -1140,7 +1330,234 @@ describe("SessionEventService streaming delta handling", () => {
 		expect(handler.ensureStreamingState).toHaveBeenCalledWith("session-123");
 	});
 
-	it("syncs mode from configOptionUpdate when a mode option is present", () => {
+	// ==========================================================================
+	// Unit 0: Characterization — reconnect and recovery invariants
+	//
+	// These tests lock in the current behavior that must stay true while the
+	// canonical pipeline replaces legacy authority (Units 2-7). They are the
+	// standing regression harness. Do not delete them; update assertions if
+	// canonical behavior is intentionally changed.
+	// ==========================================================================
+
+	it("[characterize] reconnect during in-progress tool call: creation and completion apply directly without frontend buffering", () => {
+		const disconnectedHandler = createMockHandler();
+		const session = { id: "session-123", agentId: "claude-code" } as unknown as SessionCold;
+		(disconnectedHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "idle",
+		});
+
+		// Phase 1: tool call arrives while hot state still says disconnected.
+		// Frontend no longer buffers known-session updates based on guessed connection truth.
+		const toolCallUpdate: SessionUpdate = {
+			type: "toolCall",
+			session_id: "session-123",
+			tool_call: {
+				id: "tool-read-1",
+				name: "Read",
+				status: "in_progress",
+				kind: "read",
+				arguments: { kind: "read", file_path: "/repo/src/main.ts" },
+				awaitingPlanApproval: false,
+			},
+		};
+		service.handleSessionUpdate(toolCallUpdate, disconnectedHandler, 50);
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledTimes(1);
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledWith(
+			"session-123",
+			toolCallUpdate.tool_call
+		);
+
+		// Phase 2: reconnect — there is nothing queued to replay because the update
+		// already applied directly.
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: true,
+			status: "streaming",
+			turnState: "streaming",
+		});
+		service.flushPendingEvents("session-123", disconnectedHandler);
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledTimes(1);
+
+		// Phase 3: completion update after reconnect applies without duplication
+		const completionUpdate: SessionUpdate = {
+			type: "toolCallUpdate",
+			session_id: "session-123",
+			update: {
+				toolCallId: "tool-read-1",
+				status: "completed",
+				result: { content: "// file contents" },
+			},
+		};
+		service.handleSessionUpdate(completionUpdate, disconnectedHandler, 51);
+		expect(disconnectedHandler.updateToolCallEntry).toHaveBeenCalledTimes(1);
+		expect(disconnectedHandler.updateToolCallEntry).toHaveBeenCalledWith(
+			"session-123",
+			completionUpdate.update
+		);
+	});
+
+	it("[characterize] late buffered delivery does not apply the same envelope-seq twice after reconnect", () => {
+		const disconnectedHandler = createMockHandler();
+		const session = { id: "session-123", agentId: "claude-code" } as unknown as SessionCold;
+		(disconnectedHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "idle",
+		});
+
+		const update: SessionUpdate = {
+			type: "toolCall",
+			session_id: "session-123",
+			tool_call: {
+				id: "tool-late-1",
+				name: "Search",
+				status: "in_progress",
+				kind: "search",
+				arguments: { kind: "search", query: "idempotency" },
+				awaitingPlanApproval: false,
+			},
+		};
+
+		// Same envelope-seq delivered twice while disconnected
+		service.handleSessionUpdate(update, disconnectedHandler, 77);
+		service.handleSessionUpdate(update, disconnectedHandler, 77);
+
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: true,
+			status: "idle",
+			turnState: "streaming",
+		});
+		service.flushPendingEvents("session-123", disconnectedHandler);
+
+		// Only one entry must be created — the second envelope-seq duplicate is dropped
+		expect(disconnectedHandler.createToolCallEntry).toHaveBeenCalledTimes(1);
+	});
+
+	it("[characterize] permission prompt fires exactly once even when session was just disconnected then reconnected", () => {
+		const onPermissionRequest = vi.fn();
+		service.setCallbacks({ onPermissionRequest });
+
+		const disconnectedHandler = createMockHandler();
+		const session = { id: "session-123", agentId: "copilot" } as unknown as SessionCold;
+		(disconnectedHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "idle",
+		});
+
+		// Permission requests are not buffered for disconnected sessions — they
+		// bypass the disconnected buffer and fire immediately. This invariant
+		// ensures a permission prompt is never silently lost while disconnected.
+		const permUpdate: SessionUpdate = {
+			type: "permissionRequest",
+			session_id: "session-123",
+			permission: {
+				id: "perm-reconnect-1",
+				sessionId: "session-123",
+				jsonRpcRequestId: 99,
+				permission: "Edit",
+				patterns: ["/repo/src/*.ts"],
+				metadata: { rawInput: { file_path: "/repo/src/main.ts" } },
+				always: [],
+				autoAccepted: false,
+				tool: { messageId: "", callId: "tool-edit-reconnect" },
+			},
+		};
+		service.handleSessionUpdate(permUpdate, disconnectedHandler, 80);
+
+		// Fires immediately — not buffered
+		expect(onPermissionRequest).toHaveBeenCalledTimes(1);
+		expect(onPermissionRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ id: "perm-reconnect-1" })
+		);
+
+		// Simulate reconnect + flush — no second fire
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: true,
+			status: "idle",
+			turnState: "idle",
+		});
+		service.flushPendingEvents("session-123", disconnectedHandler);
+		expect(onPermissionRequest).toHaveBeenCalledTimes(1);
+	});
+
+	it("[characterize] question prompt fires exactly once even when session was just disconnected then reconnected", () => {
+		const onQuestionRequest = vi.fn();
+		service.setCallbacks({ onQuestionRequest });
+
+		const disconnectedHandler = createMockHandler();
+		const session = { id: "session-123", agentId: "copilot" } as unknown as SessionCold;
+		(disconnectedHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "idle",
+		});
+
+		const questionUpdate: SessionUpdate = {
+			type: "questionRequest",
+			session_id: "session-123",
+			question: {
+				id: "question-reconnect-1",
+				sessionId: "session-123",
+				questions: [
+					{
+						question: "Continue with changes?",
+						header: "Confirm",
+						options: [
+							{ label: "Yes", description: "Proceed" },
+							{ label: "No", description: "Cancel" },
+						],
+						multiSelect: false,
+					},
+				],
+				tool: { messageId: "", callId: "tool-question-reconnect" },
+			},
+		};
+		service.handleSessionUpdate(questionUpdate, disconnectedHandler, 81);
+
+		// Question prompts bypass the disconnected buffer — fires immediately
+		expect(onQuestionRequest).toHaveBeenCalledTimes(1);
+		expect(onQuestionRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ id: "question-reconnect-1" })
+		);
+
+		// Flush does not re-fire the prompt
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: true,
+			status: "idle",
+			turnState: "idle",
+		});
+		service.flushPendingEvents("session-123", disconnectedHandler);
+		expect(onQuestionRequest).toHaveBeenCalledTimes(1);
+	});
+
+	it("[characterize] error path: connection-failed event rejects the lifecycle waiter and is not silently dropped", async () => {
+		const disconnectedHandler = createMockHandler();
+		const session = { id: "session-crash-1", agentId: "copilot" } as unknown as SessionCold;
+		(disconnectedHandler.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue(session);
+		// Connecting — connectionFailed bypasses the disconnected buffer
+		(disconnectedHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			isConnected: false,
+			status: "connecting",
+		});
+
+		// Register a lifecycle waiter before the event fires (simulating a reconnect attempt)
+		const { promise } = service.waitForLifecycleEvent("session-crash-1", 1, 5000);
+
+		const failUpdate: SessionUpdate = {
+			type: "connectionFailed",
+			session_id: "session-crash-1",
+			attempt_id: 1,
+			error: "Provider disconnected",
+		};
+		service.handleSessionUpdate(failUpdate, disconnectedHandler);
+
+		// Waiter promise must reject — crash/recovery receives the error deterministically
+		await expect(promise).rejects.toThrow("Provider disconnected");
+	});
+
+	it("does not infer current mode from configOptionUpdate", () => {
 		const update: SessionUpdate = {
 			type: "configOptionUpdate",
 			session_id: "session-123",
@@ -1166,10 +1583,10 @@ describe("SessionEventService streaming delta handling", () => {
 
 		service.handleSessionUpdate(update, handler);
 
-		expect(handler.updateCurrentMode).toHaveBeenCalledWith("session-123", "plan");
+		expect(handler.updateCurrentMode).not.toHaveBeenCalled();
 	});
 
-	it("ignores configOptionUpdate when no mode option is present", () => {
+	it("stores configOptionUpdate even when no mode option is present", () => {
 		const update: SessionUpdate = {
 			type: "configOptionUpdate",
 			session_id: "session-123",
@@ -1188,10 +1605,11 @@ describe("SessionEventService streaming delta handling", () => {
 
 		service.handleSessionUpdate(update, handler);
 
+		expect(handler.updateConfigOptions).toHaveBeenCalledWith("session-123", update.update.configOptions);
 		expect(handler.updateCurrentMode).not.toHaveBeenCalled();
 	});
 
-	it("ignores configOptionUpdate when mode currentValue is not a string", () => {
+	it("stores configOptionUpdate even when mode currentValue is not a string", () => {
 		const update: SessionUpdate = {
 			type: "configOptionUpdate",
 			session_id: "session-123",
@@ -1210,10 +1628,11 @@ describe("SessionEventService streaming delta handling", () => {
 
 		service.handleSessionUpdate(update, handler);
 
+		expect(handler.updateConfigOptions).toHaveBeenCalledWith("session-123", update.update.configOptions);
 		expect(handler.updateCurrentMode).not.toHaveBeenCalled();
 	});
 
-	it("drops duplicate toolCall events with the same fingerprint", () => {
+	it("drops duplicate toolCall events with the same event envelope sequence", () => {
 		const update: SessionUpdate = {
 			type: "toolCall",
 			session_id: "session-123",
@@ -1227,8 +1646,8 @@ describe("SessionEventService streaming delta handling", () => {
 			},
 		};
 
-		service.handleSessionUpdate(update, handler);
-		service.handleSessionUpdate(update, handler);
+		service.handleSessionUpdate(update, handler, 101);
+		service.handleSessionUpdate(update, handler, 101);
 
 		expect(handler.createToolCallEntry).toHaveBeenCalledTimes(1);
 	});
@@ -1317,7 +1736,7 @@ describe("SessionEventService streaming delta handling", () => {
 		expect(handler.aggregateAssistantChunk).toHaveBeenCalledTimes(2);
 	});
 
-	it("drops duplicate long assistant text chunks during replay (non-streaming turn)", () => {
+	it("drops duplicate long assistant text chunks when the same event envelope replays", () => {
 		(handler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
 			isConnected: true,
 			status: "idle",
@@ -1336,8 +1755,8 @@ describe("SessionEventService streaming delta handling", () => {
 			},
 		};
 
-		service.handleSessionUpdate(update, handler);
-		service.handleSessionUpdate(update, handler);
+		service.handleSessionUpdate(update, handler, 202);
+		service.handleSessionUpdate(update, handler, 202);
 
 		// During replay (non-streaming), drop duplicates within the window
 		expect(handler.aggregateAssistantChunk).toHaveBeenCalledTimes(1);
@@ -1368,15 +1787,12 @@ describe("SessionEventService streaming delta handling", () => {
 		expect(handler.ensureStreamingState).not.toHaveBeenCalled();
 	});
 
-	it("does not drop assistant chunks repeated outside the replay duplicate window", async () => {
+	it("does not drop repeated assistant chunks when they are separate events", async () => {
 		(handler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
 			isConnected: true,
 			status: "streaming",
 			turnState: "streaming",
 		});
-		const nowSpy = vi.spyOn(service as unknown as { nowMs: () => number }, "nowMs");
-		nowSpy.mockReturnValueOnce(1_000).mockReturnValueOnce(6_500).mockReturnValue(6_500);
-
 		const update: SessionUpdate = {
 			type: "agentMessageChunk",
 			session_id: "session-123",
@@ -1384,7 +1800,7 @@ describe("SessionEventService streaming delta handling", () => {
 			chunk: {
 				content: {
 					type: "text",
-					text: "This chunk is intentionally repeated after the duplicate replay window.",
+					text: "This chunk is intentionally repeated as a separate event.",
 				},
 			},
 		};
@@ -1497,7 +1913,7 @@ describe("SessionEventService streaming delta handling", () => {
 		);
 	});
 
-	it("applies repeated parent task tool calls when later child growth happens beyond the fingerprint prefix", () => {
+	it("applies repeated parent task tool calls when later child growth adds another child", () => {
 		markHandlerTurnAsStreaming(handler);
 		(handler.getEntries as ReturnType<typeof vi.fn>).mockReturnValue([
 			createTaskReplayEntry("task-parent-2"),
@@ -1649,7 +2065,7 @@ describe("SessionEventService streaming delta handling", () => {
 		);
 	});
 
-	it("applies repeated tool calls when top-level arguments only change after the preview cutoff", () => {
+	it("applies repeated tool calls when top-level arguments get richer", () => {
 		markHandlerTurnAsStreaming(handler);
 		(handler.getEntries as ReturnType<typeof vi.fn>).mockReturnValue([
 			createTaskReplayEntry("tool-long-args-1"),
@@ -1827,7 +2243,7 @@ describe("SessionEventService streaming delta handling", () => {
 		);
 	});
 
-	it("applies distinct toolCallUpdate events when long raw output changes after the preview cutoff", () => {
+	it("applies distinct toolCallUpdate events when long raw output gets richer", () => {
 		const sharedPrefix = "x".repeat(220);
 		const initialUpdate: Extract<SessionUpdate, { type: "toolCallUpdate" }> = {
 			type: "toolCallUpdate",
@@ -1864,7 +2280,7 @@ describe("SessionEventService streaming delta handling", () => {
 		);
 	});
 
-	it("drops replayed identical pending toolCall events once the tool already exists", () => {
+	it("drops replayed identical pending toolCall events when the same envelope replays", () => {
 		const liveHandler = createMockHandler();
 		const entriesBySession = new Map<string, SessionEntry[]>();
 		(liveHandler.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -1905,8 +2321,8 @@ describe("SessionEventService streaming delta handling", () => {
 			},
 		};
 
-		service.handleSessionUpdate(update, liveHandler);
-		service.handleSessionUpdate(update, liveHandler);
+		service.handleSessionUpdate(update, liveHandler, 404);
+		service.handleSessionUpdate(update, liveHandler, 404);
 
 		expect(liveHandler.createToolCallEntry).toHaveBeenCalledTimes(1);
 	});

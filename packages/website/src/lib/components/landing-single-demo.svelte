@@ -89,7 +89,6 @@
 			agentIconSrc: agentIcon("claude", theme),
 			projectLabel: "VC",
 			projectColor: "#E879F9",
-			projectIconSrc: null,
 			sequenceId: 3,
 			actions: [],
 		},
@@ -167,7 +166,7 @@
 					{#snippet sessionList()}
 						<div class="relative flex flex-col flex-1 min-h-0 gap-0.5 overflow-y-auto outline-none">
 							{#each sidebarGroups as group (group.name)}
-								<AppSidebarProjectGroup {group} expanded={false} />
+								<AppSidebarProjectGroup {group} />
 							{/each}
 						</div>
 					{/snippet}

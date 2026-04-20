@@ -6,15 +6,15 @@
 use super::classify_signals::build_unclassified;
 use super::classify_signals::classify_argument_shape;
 use super::kind_payload::{
-    canonical_name_for_kind, is_browser_tool_name, is_web_search_id, is_web_search_title,
+    canonical_name_for_kind, is_browser_tool_name, is_web_search_title,
     looks_like_web_search_arguments,
 };
 use super::providers;
 use super::{RawClassificationInput, SignalName};
 use crate::acp::parsers::{get_parser, AgentParser, AgentType};
 use crate::acp::session_update::{
-    derive_normalized_questions_and_todos, QuestionItem, TodoItem, ToolArguments, ToolCallLocation,
-    ToolKind,
+    derive_normalized_questions_and_todos, QuestionItem, TodoItem, TodoUpdate, ToolArguments,
+    ToolCallLocation, ToolKind,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +39,8 @@ pub(crate) struct ClassifiedToolData {
     pub arguments: ToolArguments,
     /// Parsed todo items when the tool is a TodoWrite-family tool (e.g. Copilot `update_todos`).
     pub normalized_todos: Option<Vec<TodoItem>>,
+    /// Semantic todo update payload when a tool mutates todo state.
+    pub normalized_todo_update: Option<TodoUpdate>,
     /// Parsed question items when the tool is a question-type tool.
     pub normalized_questions: Option<Vec<QuestionItem>>,
 }
@@ -66,6 +68,7 @@ fn infer_kind_from_serialized_arguments(arguments: &serde_json::Value) -> Option
 }
 
 fn apply_web_search_promotion(
+    agent: AgentType,
     kind: ToolKind,
     id: &str,
     title: Option<&str>,
@@ -76,7 +79,7 @@ fn apply_web_search_promotion(
             .map(looks_like_web_search_arguments)
             .unwrap_or(false);
     if matches!(kind, ToolKind::Fetch | ToolKind::Search | ToolKind::Other)
-        && (is_web_search_id(id)
+        && (providers::is_web_search_tool_call_id(agent, id)
             || title.map(is_web_search_title).unwrap_or(false)
             || argument_implied_web_search)
     {
@@ -163,7 +166,8 @@ fn resolve_identity_impl(
         .or(location_kind)
         .or(title_read_kind)
         .unwrap_or(base_output.kind);
-    let kind = apply_web_search_promotion(kind, id, hints.title, raw_arguments);
+    let kind =
+        apply_web_search_promotion(parser.agent_type(), kind, id, hints.title, raw_arguments);
 
     let name_is_browser = explicit_name.map(is_browser_tool_name).unwrap_or(false);
     let title_is_browser = hints.title.map(is_browser_tool_name).unwrap_or(false);
@@ -313,7 +317,7 @@ pub(crate) fn classify_raw_tool_call(
         identity.name
     };
 
-    let (normalized_questions, normalized_todos) =
+    let (normalized_questions, normalized_todos, normalized_todo_update) =
         derive_normalized_questions_and_todos(&name, raw_arguments, parser.agent_type());
 
     ClassifiedToolData {
@@ -321,6 +325,7 @@ pub(crate) fn classify_raw_tool_call(
         kind,
         arguments,
         normalized_todos,
+        normalized_todo_update,
         normalized_questions,
     }
 }
@@ -350,7 +355,7 @@ pub(crate) fn classify_serialized_tool_call(
         identity.name
     };
 
-    let (normalized_questions, normalized_todos) =
+    let (normalized_questions, normalized_todos, normalized_todo_update) =
         derive_normalized_questions_and_todos(&name, raw_arguments, agent);
 
     ClassifiedToolData {
@@ -358,6 +363,7 @@ pub(crate) fn classify_serialized_tool_call(
         kind,
         arguments,
         normalized_todos,
+        normalized_todo_update,
         normalized_questions,
     }
 }
@@ -548,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn serialized_description_and_query_do_not_promote_to_task() {
+    fn serialized_todo_sql_does_not_promote_to_task() {
         let classified = classify_serialized_tool_call(
             AgentType::Copilot,
             "tool-sql",
@@ -566,13 +572,10 @@ mod tests {
         );
 
         assert_ne!(classified.kind, ToolKind::Task);
-        assert_eq!(classified.kind, ToolKind::Sql);
+        assert_eq!(classified.kind, ToolKind::Todo);
         assert!(matches!(
             classified.arguments,
-            ToolArguments::Sql {
-                query: Some(_),
-                description: Some(_)
-            }
+            ToolArguments::Think { raw: Some(_), .. }
         ));
     }
 

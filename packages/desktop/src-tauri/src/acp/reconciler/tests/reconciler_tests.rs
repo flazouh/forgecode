@@ -1,3 +1,4 @@
+use crate::acp::parsers::AgentType;
 use crate::acp::reconciler::{
     classify_with_provider_name_kind, RawClassificationInput, SignalName,
 };
@@ -6,6 +7,7 @@ use crate::acp::session_update::{ToolArguments, ToolKind};
 #[test]
 fn provider_name_kind_has_highest_priority() {
     let output = classify_with_provider_name_kind(
+        AgentType::ClaudeCode,
         Some(ToolKind::Read),
         &RawClassificationInput {
             id: "tool-read",
@@ -22,8 +24,9 @@ fn provider_name_kind_has_highest_priority() {
 }
 
 #[test]
-fn sql_argument_shape_wins_before_task_like_description() {
+fn todo_sql_argument_shape_wins_before_task_like_description() {
     let output = classify_with_provider_name_kind(
+        AgentType::ClaudeCode,
         None,
         &RawClassificationInput {
             id: "tool-sql",
@@ -37,20 +40,28 @@ fn sql_argument_shape_wins_before_task_like_description() {
         },
     );
 
-    assert_eq!(output.kind, ToolKind::Sql);
+    assert_eq!(output.kind, ToolKind::Todo);
     assert_eq!(output.signals_tried, vec![SignalName::ProviderName]);
     match output.arguments {
-        ToolArguments::Sql { query, description } => {
-            assert_eq!(query.as_deref(), Some("UPDATE todos SET status = 'done'"));
-            assert_eq!(description.as_deref(), Some("Mark all done"));
+        ToolArguments::Think { raw, .. } => {
+            let raw = raw.expect("raw todo payload");
+            assert_eq!(
+                raw.get("query").and_then(serde_json::Value::as_str),
+                Some("UPDATE todos SET status = 'done'")
+            );
+            assert_eq!(
+                raw.get("description").and_then(serde_json::Value::as_str),
+                Some("Mark all done")
+            );
         }
-        other => panic!("expected sql arguments, got {other:?}"),
+        other => panic!("expected todo arguments, got {other:?}"),
     }
 }
 
 #[test]
 fn empty_inputs_become_unclassified_with_all_failed_signals() {
     let output = classify_with_provider_name_kind(
+        AgentType::ClaudeCode,
         None,
         &RawClassificationInput {
             id: "tool-empty",
@@ -88,8 +99,9 @@ fn empty_inputs_become_unclassified_with_all_failed_signals() {
 }
 
 #[test]
-fn promotes_fetch_to_web_search_from_search_id() {
+fn cursor_promotes_fetch_to_web_search_from_search_id() {
     let output = classify_with_provider_name_kind(
+        AgentType::Cursor,
         None,
         &RawClassificationInput {
             id: "ws_123",
@@ -106,6 +118,7 @@ fn promotes_fetch_to_web_search_from_search_id() {
 #[test]
 fn promotes_browser_title_even_when_otherwise_unclassified() {
     let output = classify_with_provider_name_kind(
+        AgentType::ClaudeCode,
         None,
         &RawClassificationInput {
             id: "tool-browser",

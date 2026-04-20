@@ -79,6 +79,7 @@ impl AgentClient for OpenCodeHttpClient {
         let mut response = NewSessionResponse {
             session_id: session.id,
             sequence_id: None,
+            session_open: None,
             models: SessionModelState {
                 available_models,
                 current_model_id,
@@ -180,6 +181,15 @@ impl AgentClient for OpenCodeHttpClient {
         self.seed_current_model(&response.models.current_model_id)?;
 
         Ok(response)
+    }
+
+    async fn reconnect_session(
+        &mut self,
+        session_id: String,
+        cwd: String,
+        _launch_mode_id: Option<String>,
+    ) -> AcpResult<ResumeSessionResponse> {
+        self.resume_session(session_id, cwd).await
     }
 
     async fn fork_session(

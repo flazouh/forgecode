@@ -5,17 +5,17 @@
  * All commands are type-checked at compile time.
  */
 
-import { errAsync, okAsync, type ResultAsync } from "neverthrow";
+import { okAsync, type ResultAsync } from "neverthrow";
 import type {
 	ProviderMetadataProjection,
 	SessionOpenResult,
-	SessionProjectionSnapshot,
+	SessionStateEnvelope,
 } from "../../services/acp-types.js";
 import type { StartupSessionsResponse } from "../../services/claude-history-types";
-import type { ConfigOptionData, ConvertedSession } from "../../services/converted-session-types.js";
+import type { ConfigOptionData } from "../../services/converted-session-types.js";
 import { tauriClient } from "../../utils/tauri-client";
 import type { ScanProjectSessionsResponse } from "../../utils/tauri-client/types";
-import { AgentError, type AppError } from "../errors/app-error";
+import type { AppError } from "../errors/app-error";
 import type { InteractionReplyRequest } from "../types/interaction-reply-request.js";
 import type { AgentAvailabilityKind, PersistedWorkspaceState, ResumeSessionResult } from "./types";
 
@@ -177,10 +177,8 @@ export function closeSession(sessionId: string): ResultAsync<void, AppError> {
 	return tauriClient.acp.closeSession(sessionId);
 }
 
-export function getSessionProjection(
-	sessionId: string
-): ResultAsync<SessionProjectionSnapshot, AppError> {
-	return tauriClient.acp.getSessionProjection(sessionId);
+export function getSessionState(sessionId: string): ResultAsync<SessionStateEnvelope, AppError> {
+	return tauriClient.acp.getSessionState(sessionId);
 }
 
 // ============================================
@@ -211,32 +209,6 @@ export function getStartupSessions(
 	return tauriClient.history.getStartupSessions(sessionIds);
 }
 
-/**
- * Get a session with full entries from any agent.
- * Routes to agent-specific parsers that read from source files.
- *
- * @param sessionId - The session ID to load
- * @param projectPath - The project path for this session
- * @param agentId - The agent ID ("claude-code", "cursor", "opencode")
- * @param sourcePath - Optional source file path for direct O(1) retrieval (Cursor sessions)
- * @returns ResultAsync containing ConvertedSession (unified format)
- */
-export function getSession(
-	sessionId: string,
-	projectPath: string,
-	agentId: string,
-	sourcePath?: string
-): ResultAsync<ConvertedSession, AppError> {
-	return tauriClient.history
-		.getUnifiedSession(sessionId, projectPath, agentId, sourcePath)
-		.andThen((session) => {
-			if (session !== null) {
-				return okAsync(session);
-			}
-			return errAsync(new AgentError("get_session", new Error(`Session ${sessionId} not found`)));
-	});
-}
-
 export function getSessionOpenResult(
 	sessionId: string,
 	projectPath: string,
@@ -244,17 +216,6 @@ export function getSessionOpenResult(
 	sourcePath?: string
 ): ResultAsync<SessionOpenResult, AppError> {
 	return tauriClient.history.getSessionOpenResult(sessionId, projectPath, agentId, sourcePath);
-}
-
-/**
- * @deprecated Use getSession() instead
- * Get a converted session with full entries.
- */
-export function getConvertedSession(
-	sessionId: string,
-	projectPath: string
-): ResultAsync<ConvertedSession, AppError> {
-	return getSession(sessionId, projectPath, "claude-code");
 }
 
 export function setSessionTitle(sessionId: string, title: string): ResultAsync<void, AppError> {
@@ -340,7 +301,7 @@ export const api = {
 	setConfigOption,
 	stopStreaming,
 	closeSession,
-	getSessionProjection,
+	getSessionState,
 	replyInteraction,
 	replyPermission,
 	replyQuestion,
@@ -349,9 +310,7 @@ export const api = {
 	// History
 	scanSessions,
 	getStartupSessions,
-	getSession,
 	getSessionOpenResult,
-	getConvertedSession,
 	setSessionTitle,
 
 	// Workspace

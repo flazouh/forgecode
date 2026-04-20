@@ -16,7 +16,7 @@ pub(crate) mod visibility;
 
 // Re-export commonly used types
 pub use commands::{
-    audit_session_load_timing, get_session_open_result, get_startup_sessions, get_unified_session,
+    audit_session_load_timing, get_session_open_result, get_startup_sessions,
     scan_project_sessions, SessionLoadTiming, TimingStage,
 };
 pub use constants::{MAX_PROJECTS_TO_SCAN, MAX_SESSIONS_PER_PROJECT};

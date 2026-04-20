@@ -1,9 +1,10 @@
 use crate::acp::parsers::AgentType;
+use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::ToolCallUpdateData;
 use crate::acp::tool_call_presentation::{
     merge_tool_arguments, synthesize_locations, synthesize_title, title_is_placeholder,
 };
-use crate::session_jsonl::types::{ConvertedSession, FullSession, StoredEntry};
+use crate::session_jsonl::types::{FullSession, StoredEntry};
 
 #[derive(serde::Deserialize)]
 struct StreamingLogEntry {
@@ -11,15 +12,22 @@ struct StreamingLogEntry {
     data: serde_json::Value,
 }
 
-#[allow(dead_code)]
-pub(crate) fn convert_cursor_full_session_to_entries(session: &FullSession) -> ConvertedSession {
-    let mut converted =
-        super::fullsession::convert_full_session_to_entries_with_agent(session, AgentType::Cursor);
-    overlay_streaming_tool_updates(&session.session_id, &mut converted);
-    converted
+pub(crate) fn convert_cursor_full_session_to_thread_snapshot(
+    session: &FullSession,
+) -> SessionThreadSnapshot {
+    let mut snapshot = super::fullsession::convert_full_session_to_thread_snapshot_with_agent(
+        session,
+        AgentType::Cursor,
+    );
+    overlay_streaming_tool_updates(&session.session_id, &mut snapshot);
+    snapshot
 }
 
-fn overlay_streaming_tool_updates(session_id: &str, converted: &mut ConvertedSession) {
+fn overlay_streaming_tool_updates(session_id: &str, snapshot: &mut SessionThreadSnapshot) {
+    overlay_streaming_tool_updates_for_entries(session_id, &mut snapshot.entries);
+}
+
+fn overlay_streaming_tool_updates_for_entries(session_id: &str, entries: &mut [StoredEntry]) {
     let Some(log_path) = crate::acp::streaming_log::get_log_file_path(session_id) else {
         return;
     };
@@ -61,12 +69,12 @@ fn overlay_streaming_tool_updates(session_id: &str, converted: &mut ConvertedSes
             continue;
         };
 
-        apply_tool_call_update(converted, &update);
+        apply_tool_call_update(entries, &update);
     }
 }
 
-fn apply_tool_call_update(converted: &mut ConvertedSession, update: &ToolCallUpdateData) {
-    let Some(tool_call) = converted.entries.iter_mut().find_map(|entry| match entry {
+fn apply_tool_call_update(entries: &mut [StoredEntry], update: &ToolCallUpdateData) {
+    let Some(tool_call) = entries.iter_mut().find_map(|entry| match entry {
         StoredEntry::ToolCall { id, message, .. } if id == &update.tool_call_id => Some(message),
         _ => None,
     }) else {
@@ -135,11 +143,11 @@ fn normalize_cursor_tool_call_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
     use crate::acp::session_update::{
         SessionUpdate, ToolArguments, ToolCallData, ToolCallStatus, ToolKind,
     };
     use crate::acp::streaming_log::{clear_session_log, log_emitted_event};
-    use crate::session_jsonl::types::SessionStats;
 
     #[test]
     fn overlays_edit_arguments_from_streaming_log() {
@@ -183,7 +191,7 @@ mod tests {
 
         log_emitted_event(session_id, &emitted_update);
 
-        let mut converted = ConvertedSession {
+        let mut converted = SessionThreadSnapshot {
             entries: vec![StoredEntry::ToolCall {
                 id: "tool-edit-1".to_string(),
                 message: ToolCallData {
@@ -207,6 +215,7 @@ mod tests {
                     skill_meta: None,
                     normalized_questions: None,
                     normalized_todos: None,
+                    normalized_todo_update: None,
                     parent_tool_use_id: None,
                     task_children: None,
                     question_answer: None,
@@ -215,13 +224,12 @@ mod tests {
                 },
                 timestamp: Some("2026-03-20T07:49:55.869382+00:00".to_string()),
             }],
-            stats: SessionStats::default(),
             title: "Cursor Session".to_string(),
             created_at: "2026-03-20T07:49:55.000000+00:00".to_string(),
             current_mode_id: None,
         };
 
-        overlay_streaming_tool_updates(session_id, &mut converted);
+        overlay_streaming_tool_updates_for_entries(session_id, &mut converted.entries);
 
         let StoredEntry::ToolCall { message, .. } = &converted.entries[0] else {
             panic!("expected tool call entry");
@@ -276,7 +284,7 @@ mod tests {
 
         log_emitted_event(session_id, &emitted_update);
 
-        let mut converted = ConvertedSession {
+        let mut converted = SessionThreadSnapshot {
             entries: vec![StoredEntry::ToolCall {
                 id: "tool-rename-1".to_string(),
                 message: ToolCallData {
@@ -300,6 +308,7 @@ mod tests {
                     skill_meta: None,
                     normalized_questions: None,
                     normalized_todos: None,
+                    normalized_todo_update: None,
                     parent_tool_use_id: None,
                     task_children: None,
                     question_answer: None,
@@ -308,13 +317,12 @@ mod tests {
                 },
                 timestamp: Some("2026-03-20T07:49:55.869382+00:00".to_string()),
             }],
-            stats: SessionStats::default(),
             title: "Cursor Session".to_string(),
             created_at: "2026-03-20T07:49:55.000000+00:00".to_string(),
             current_mode_id: None,
         };
 
-        overlay_streaming_tool_updates(session_id, &mut converted);
+        overlay_streaming_tool_updates_for_entries(session_id, &mut converted.entries);
 
         let StoredEntry::ToolCall { message, .. } = &converted.entries[0] else {
             panic!("expected tool call entry");
@@ -367,7 +375,7 @@ mod tests {
 
         log_emitted_event(session_id, &emitted_update);
 
-        let mut converted = ConvertedSession {
+        let mut converted = SessionThreadSnapshot {
             entries: vec![StoredEntry::ToolCall {
                 id: "tool-read-1".to_string(),
                 message: ToolCallData {
@@ -386,6 +394,7 @@ mod tests {
                     skill_meta: None,
                     normalized_questions: None,
                     normalized_todos: None,
+                    normalized_todo_update: None,
                     parent_tool_use_id: None,
                     task_children: None,
                     question_answer: None,
@@ -394,13 +403,12 @@ mod tests {
                 },
                 timestamp: Some("2026-03-20T07:49:55.869382+00:00".to_string()),
             }],
-            stats: SessionStats::default(),
             title: "Cursor Session".to_string(),
             created_at: "2026-03-20T07:49:55.000000+00:00".to_string(),
             current_mode_id: None,
         };
 
-        overlay_streaming_tool_updates(session_id, &mut converted);
+        overlay_streaming_tool_updates_for_entries(session_id, &mut converted.entries);
 
         let StoredEntry::ToolCall { message, .. } = &converted.entries[0] else {
             panic!("expected tool call entry");

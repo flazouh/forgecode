@@ -1,3 +1,4 @@
+use super::plan::{enrich_plan_data, enrich_plan_update};
 use super::*;
 use crate::acp::streaming_log::log_debug_event;
 use crate::acp::task_reconciler::TaskReconciliationPolicy;
@@ -195,6 +196,7 @@ mod tests {
                 command: "copilot".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                env_strategy: None,
             }
         }
 
@@ -225,6 +227,7 @@ mod tests {
                 skill_meta: None,
                 normalized_questions: None,
                 normalized_todos: None,
+                normalized_todo_update: None,
                 parent_tool_use_id: None,
                 task_children: None,
                 question_answer: None,
@@ -253,6 +256,7 @@ mod tests {
                 skill_meta: None,
                 normalized_questions: None,
                 normalized_todos: None,
+                normalized_todo_update: None,
                 parent_tool_use_id: None,
                 task_children: None,
                 question_answer: None,

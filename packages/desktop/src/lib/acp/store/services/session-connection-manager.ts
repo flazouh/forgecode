@@ -18,9 +18,10 @@ import {
 	type ProviderMetadataProjection,
 	resolveProviderMetadataProjection,
 } from "../../../services/acp-provider-metadata.js";
-import type { SessionModelState as AcpSessionModelState } from "../../../services/acp-types.js";
 import type {
-} from "../../../services/converted-session-types.js";
+	SessionModelState as AcpSessionModelState,
+	SessionOpenResult,
+} from "../../../services/acp-types.js";
 import { tauriClient } from "../../../utils/tauri-client.js";
 import type { AppError } from "../../errors/app-error.js";
 import { AgentError, ConnectionError, SessionNotFoundError } from "../../errors/app-error.js";
@@ -59,6 +60,11 @@ let nextAttemptId = 1;
 interface ConnectSessionOptions {
 	agentOverrideId?: string;
 	openToken?: string;
+}
+
+export interface CreatedSessionResult {
+	readonly session: SessionCold;
+	readonly sessionOpen: SessionOpenResult | null;
 }
 
 type ProviderAwareSessionModelState = AcpSessionModelState & {
@@ -111,17 +117,6 @@ export class SessionConnectionManager {
 
 	private supportsAutonomousMode(modeId: string | undefined): boolean {
 		return modeId === CanonicalModeId.BUILD;
-	}
-
-	private resolveResumeLaunchModeId(
-		agentId: string,
-		modeId: string | undefined
-	): string | undefined {
-		if (agentId !== "copilot") {
-			return undefined;
-		}
-
-		return modeId;
 	}
 
 	private resolveProviderMetadata(
@@ -272,7 +267,7 @@ export class SessionConnectionManager {
 			launchToken?: string;
 		},
 		eventHandler: SessionEventHandler
-	): ResultAsync<SessionCold, AppError> {
+	): ResultAsync<CreatedSessionResult, AppError> {
 		const sessionCwd = options.worktreePath ? options.worktreePath : options.projectPath;
 		logger.info("[first-send-trace] connection manager createSession", {
 			projectPath: options.projectPath,
@@ -557,7 +552,10 @@ export class SessionConnectionManager {
 								sessionId,
 							});
 
-							return sessionCold;
+							return {
+								session: sessionCold,
+								sessionOpen: result.sessionOpen ?? null,
+							};
 						});
 					});
 			})
@@ -599,24 +597,6 @@ export class SessionConnectionManager {
 			});
 			return okAsync(session);
 		}
-		// Defensive guard: if we already have a bound ACP session ID for this thread,
-		// treat it as connected instead of issuing another resume call (which can replay history).
-		if (hotState.acpSessionId === sessionId && hotState.status !== "error") {
-			logger.info(
-				"Session has bound ACP session ID while disconnected; skipping duplicate resume",
-				{
-					sessionId,
-					status: hotState.status,
-				}
-			);
-			this.hotStateManager.updateHotState(sessionId, {
-				isConnected: true,
-				status: hotState.status === "idle" ? "ready" : hotState.status,
-				connectionError: null,
-			});
-			return okAsync(session);
-		}
-
 		const pending = this.pendingConnections.get(sessionId);
 		if (pending) {
 			logger.debug("Connection already in flight, returning pending", { sessionId });
@@ -626,7 +606,6 @@ export class SessionConnectionManager {
 		this.connectionManager.setConnecting(sessionId, true);
 		// Start connection in state machine
 		this.connectionManager.sendConnectionConnect(sessionId);
-
 		this.hotStateManager.updateHotState(sessionId, {
 			status: "connecting",
 			connectionError: null,
@@ -635,10 +614,9 @@ export class SessionConnectionManager {
 		const resumeCwd = session.projectPath;
 		const attemptId = nextAttemptId++;
 		const reconnectHotState = this.stateReader.getHotState(sessionId);
-		const resumeLaunchModeId = this.resolveResumeLaunchModeId(
-			effectiveAgentId,
-			reconnectHotState.currentMode ? reconnectHotState.currentMode.id : undefined
-		);
+		const resumeLaunchModeId = reconnectHotState.currentMode
+			? reconnectHotState.currentMode.id
+			: undefined;
 
 		const lifecycleWaiter = this.eventService.waitForLifecycleEvent(
 			sessionId,
@@ -672,7 +650,6 @@ export class SessionConnectionManager {
 			)
 			.andThen((data) => {
 				this.handleConnectionComplete(sessionId, effectiveAgentId, data);
-				this.eventService.flushPendingEvents(sessionId, eventHandler);
 				const cold = this.stateReader.getSessionCold(sessionId);
 				if (!cold) {
 					return errAsync(new SessionNotFoundError(sessionId));
@@ -689,28 +666,9 @@ export class SessionConnectionManager {
 				lifecycleWaiter.cancel();
 
 				const errorMessage = error instanceof Error ? error.message : String(error);
-				const isMethodNotFound =
-					errorMessage.includes("Method not found") || errorMessage.includes("-32601");
 
 				// Connection failed in state machine
 				this.connectionManager.sendConnectionError(sessionId);
-
-				if (isMethodNotFound) {
-					logger.debug("Agent does not support session resume, session is read-only", {
-						sessionId,
-						agentId: session.agentId,
-					});
-					this.hotStateManager.updateHotState(sessionId, {
-						status: "idle",
-						isConnected: false,
-						availableCommands: [],
-						connectionError: "Session is read-only (agent does not support resume)",
-					});
-					return new ConnectionError(
-						`Session is read-only (agent does not support resume)`,
-						error instanceof Error ? error : undefined
-					);
-				}
 
 				this.hotStateManager.updateHotState(sessionId, {
 					status: "error",

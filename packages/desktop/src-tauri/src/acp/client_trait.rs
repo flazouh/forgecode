@@ -52,6 +52,14 @@ pub trait AgentClient: Send + Sync {
         self.resume_session(session_id, cwd).await
     }
 
+    /// Reconnect an existing session using provider-owned semantics.
+    async fn reconnect_session(
+        &mut self,
+        session_id: String,
+        cwd: String,
+        launch_mode_id: Option<String>,
+    ) -> AcpResult<ResumeSessionResponse>;
+
     /// Fork a session (creates a new session with copied history)
     async fn fork_session(
         &mut self,

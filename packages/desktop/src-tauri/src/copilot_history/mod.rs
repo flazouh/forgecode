@@ -4,14 +4,15 @@ pub(crate) use parser::{
 };
 
 use crate::acp::session_descriptor::SessionReplayContext;
+use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::{
     SessionUpdate, ToolArguments, ToolCallData, TurnErrorData, TurnErrorKind,
 };
 use crate::acp::types::ContentBlock;
 use crate::session_converter::{calculate_todo_timing, merge_tool_call_update};
 use crate::session_jsonl::types::{
-    ConvertedSession, SessionStats, StoredAssistantChunk, StoredAssistantMessage,
-    StoredContentBlock, StoredEntry, StoredErrorMessage, StoredUserMessage,
+    StoredAssistantChunk, StoredAssistantMessage, StoredContentBlock, StoredEntry,
+    StoredErrorMessage, StoredUserMessage,
 };
 use chrono::{TimeZone, Utc};
 use std::collections::HashMap;
@@ -34,18 +35,18 @@ pub async fn list_workspace_sessions(
     parser::scan_copilot_sessions_at_root(&session_state_root, project_paths).await
 }
 
-pub async fn load_session(
+pub async fn load_thread_snapshot(
     _app: &AppHandle,
     replay_context: &SessionReplayContext,
     _cwd: &str,
     title: &str,
-) -> Result<Option<ConvertedSession>, String> {
+) -> Result<Option<SessionThreadSnapshot>, String> {
     let session_state_root = parser::resolve_copilot_session_state_root()?;
     let transcript_path = resolve_transcript_path(&session_state_root, replay_context);
 
     match parser::parse_copilot_session_at_root(&session_state_root, &transcript_path, title).await
     {
-        Ok(converted) => Ok(Some(converted)),
+        Ok(snapshot) => Ok(Some(snapshot)),
         Err(error) => {
             tracing::info!(
                 session_id = %replay_context.local_session_id,
@@ -77,7 +78,7 @@ pub(crate) fn convert_replay_updates_to_session(
     session_id: &str,
     title: &str,
     updates: &[(u64, SessionUpdate)],
-) -> ConvertedSession {
+) -> SessionThreadSnapshot {
     let mut accumulator = ReplayAccumulator::new();
 
     for (emitted_at_ms, update) in updates {
@@ -261,6 +262,9 @@ fn merge_replay_tool_call(current: ToolCallData, incoming: ToolCallData) -> Tool
             .normalized_questions
             .or(current.normalized_questions),
         normalized_todos: incoming.normalized_todos.or(current.normalized_todos),
+        normalized_todo_update: incoming
+            .normalized_todo_update
+            .or(current.normalized_todo_update),
         parent_tool_use_id: incoming.parent_tool_use_id.or(current.parent_tool_use_id),
         task_children: incoming.task_children.or(current.task_children),
         question_answer: incoming.question_answer.or(current.question_answer),
@@ -351,7 +355,7 @@ impl ReplayAccumulator {
         }
     }
 
-    fn finish(mut self, session_id: &str, title: &str) -> ConvertedSession {
+    fn finish(mut self, session_id: &str, title: &str) -> SessionThreadSnapshot {
         calculate_todo_timing(&mut self.entries);
 
         let resolved_title = if title.trim().is_empty() {
@@ -360,8 +364,7 @@ impl ReplayAccumulator {
             title.to_string()
         };
 
-        ConvertedSession {
-            stats: build_stats(&self.entries),
+        SessionThreadSnapshot {
             title: resolved_title,
             created_at: self
                 .first_event_timestamp
@@ -478,38 +481,6 @@ impl ReplayAccumulator {
     }
 }
 
-fn build_stats(entries: &[StoredEntry]) -> SessionStats {
-    let mut stats = SessionStats {
-        total_messages: entries.len(),
-        ..SessionStats::default()
-    };
-
-    for entry in entries {
-        match entry {
-            StoredEntry::User { .. } => {
-                stats.user_messages += 1;
-            }
-            StoredEntry::Assistant { message, .. } => {
-                stats.assistant_messages += 1;
-                stats.thinking_blocks += message
-                    .chunks
-                    .iter()
-                    .filter(|chunk| chunk.chunk_type == "thought")
-                    .count();
-            }
-            StoredEntry::ToolCall { message, .. } => {
-                stats.tool_uses += 1;
-                if message.result.is_some() {
-                    stats.tool_results += 1;
-                }
-            }
-            StoredEntry::Error { .. } => {}
-        }
-    }
-
-    stats
-}
-
 #[cfg(test)]
 mod tests {
     use super::{convert_replay_updates_to_session, resolve_transcript_path};
@@ -615,6 +586,7 @@ mod tests {
                             skill_meta: None,
                             normalized_questions: None,
                             normalized_todos: None,
+                            normalized_todo_update: None,
                             parent_tool_use_id: None,
                             task_children: None,
                             question_answer: None,
@@ -688,6 +660,7 @@ mod tests {
             skill_meta: None,
             normalized_questions: None,
             normalized_todos: None,
+            normalized_todo_update: None,
             parent_tool_use_id: Some("task-1".to_string()),
             task_children: None,
             question_answer: None,
@@ -724,6 +697,7 @@ mod tests {
                             skill_meta: None,
                             normalized_questions: None,
                             normalized_todos: None,
+                            normalized_todo_update: None,
                             parent_tool_use_id: None,
                             task_children: None,
                             question_answer: None,
@@ -758,6 +732,7 @@ mod tests {
                             skill_meta: None,
                             normalized_questions: None,
                             normalized_todos: None,
+                            normalized_todo_update: None,
                             parent_tool_use_id: None,
                             task_children: Some(vec![child_tool.clone()]),
                             question_answer: None,

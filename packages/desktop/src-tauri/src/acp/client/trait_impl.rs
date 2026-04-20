@@ -45,6 +45,16 @@ impl AgentClient for AcpClient {
         self.load_session(session_id, cwd).await
     }
 
+    async fn reconnect_session(
+        &mut self,
+        session_id: String,
+        cwd: String,
+        launch_mode_id: Option<String>,
+    ) -> AcpResult<ResumeSessionResponse> {
+        self.reconnect_live_session(session_id, cwd, launch_mode_id)
+            .await
+    }
+
     async fn fork_session(
         &mut self,
         session_id: String,

@@ -1,8 +1,6 @@
 //! Codex session parser for local rollout JSONL files.
 //!
 //! Codex stores sessions under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
-//! This parser loads a single session transcript and converts it to the unified
-//! `ConvertedSession` format used by the frontend.
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -14,21 +12,22 @@ use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::acp::parsers::{get_parser, AgentParser, AgentType, CodexParser};
+use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::{
-    parse_normalized_questions, parse_normalized_todos, tool_call_status_from_str, ToolArguments,
-    ToolCallData,
+    parse_normalized_questions, parse_normalized_todo_update, parse_normalized_todos,
+    tool_call_status_from_str, ToolArguments, ToolCallData,
 };
 use crate::session_jsonl::types::{
-    ConvertedSession, SessionStats, StoredAssistantChunk, StoredAssistantMessage,
-    StoredContentBlock, StoredEntry, StoredUserMessage,
+    StoredAssistantChunk, StoredAssistantMessage, StoredContentBlock, StoredEntry,
+    StoredUserMessage,
 };
 
 /// Load a Codex session from local rollout files.
-pub async fn load_session(
+pub async fn load_thread_snapshot(
     session_id: &str,
     project_path: &str,
     source_path: Option<&str>,
-) -> Result<Option<ConvertedSession>> {
+) -> Result<Option<SessionThreadSnapshot>> {
     let Some(path) = resolve_session_file_path(session_id, project_path, source_path).await else {
         return Ok(None);
     };
@@ -192,6 +191,8 @@ pub async fn load_session(
                             parse_normalized_questions(&name, &raw_arguments, AgentType::Codex);
                         let normalized_todos =
                             parse_normalized_todos(&name, &raw_arguments, AgentType::Codex);
+                        let normalized_todo_update =
+                            parse_normalized_todo_update(&name, &raw_arguments, AgentType::Codex);
 
                         serial += 1;
                         let entry = StoredEntry::ToolCall {
@@ -215,6 +216,7 @@ pub async fn load_session(
                                 locations: None,
                                 normalized_questions,
                                 normalized_todos,
+                                normalized_todo_update,
                                 parent_tool_use_id: None,
                                 task_children: None,
                                 awaiting_plan_approval: false,
@@ -266,11 +268,8 @@ pub async fn load_session(
         .as_deref()
         .and_then(|t| crate::history::title_utils::derive_session_title(t, 100))
         .unwrap_or_else(|| "New Thread".to_string());
-    let stats = build_stats(&entries);
-
-    Ok(Some(ConvertedSession {
+    Ok(Some(SessionThreadSnapshot {
         entries,
-        stats,
         title,
         created_at,
         current_mode_id: None,
@@ -487,46 +486,6 @@ fn infer_tool_status_from_output(output: &str) -> String {
     }
 
     "completed".to_string()
-}
-
-fn build_stats(entries: &[StoredEntry]) -> SessionStats {
-    let mut stats = SessionStats {
-        total_messages: 0,
-        user_messages: 0,
-        assistant_messages: 0,
-        tool_uses: 0,
-        tool_results: 0,
-        thinking_blocks: 0,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-    };
-
-    for entry in entries {
-        match entry {
-            StoredEntry::User { .. } => {
-                stats.total_messages += 1;
-                stats.user_messages += 1;
-            }
-            StoredEntry::Assistant { message, .. } => {
-                stats.total_messages += 1;
-                stats.assistant_messages += 1;
-                stats.thinking_blocks += message
-                    .chunks
-                    .iter()
-                    .filter(|chunk| chunk.chunk_type == "thought")
-                    .count();
-            }
-            StoredEntry::ToolCall { message, .. } => {
-                stats.tool_uses += 1;
-                if message.result.is_some() {
-                    stats.tool_results += 1;
-                }
-            }
-            StoredEntry::Error { .. } => {}
-        }
-    }
-
-    stats
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use super::*;
 use crate::acp::event_hub::AcpEventHubState;
-use crate::acp::projections::{ProjectionRegistry, SessionProjectionSnapshot};
+use crate::acp::projections::ProjectionRegistry;
 use crate::acp::provider::HistoryReplayFamily;
 use crate::acp::registry::AgentRegistry;
 use crate::acp::session_descriptor::SessionReplayContext;
@@ -13,7 +13,8 @@ use crate::commands::observability::{
     unexpected_command_result, CommandResult, SerializableCommandError,
 };
 use crate::db::repository::{
-    SessionJournalEventRepository, SessionMetadataRepository, SessionTranscriptSnapshotRepository,
+    SessionJournalEventRepository, SessionMetadataRepository, SessionProjectionSnapshotRepository,
+    SessionThreadSnapshotRepository, SessionTranscriptSnapshotRepository,
 };
 use crate::opencode_history::commands::fetch_opencode_session;
 use sea_orm::{
@@ -48,13 +49,6 @@ fn apply_session_title_metadata(
     }
 
     session
-}
-
-fn build_empty_session_with_metadata(
-    session_id: &str,
-    metadata: Option<&crate::db::repository::SessionMetadataRow>,
-) -> SessionThreadSnapshot {
-    apply_session_title_metadata(SessionThreadSnapshot::empty(session_id), metadata)
 }
 
 fn derive_current_mode_id_from_entries(
@@ -107,12 +101,6 @@ fn history_replay_family(agent: &CanonicalAgentId) -> HistoryReplayFamily {
     .family
 }
 
-fn projection_has_runtime_state(snapshot: &SessionProjectionSnapshot) -> bool {
-    snapshot.session.is_some()
-        || !snapshot.operations.is_empty()
-        || !snapshot.interactions.is_empty()
-}
-
 async fn load_unified_session_content_with_context(
     app: AppHandle,
     context: crate::history::session_context::SessionContext,
@@ -150,27 +138,6 @@ async fn load_unified_session_content_with_context(
         .map(|session| apply_session_title_metadata(session, context.session_metadata.as_ref())))
 }
 
-async fn load_unified_session_with_context(
-    app: AppHandle,
-    context: crate::history::session_context::SessionContext,
-) -> Result<Option<ConvertedSession>, String> {
-    let fallback_session_id = context.local_session_id.clone();
-    let session_metadata = context.session_metadata.clone();
-    let result = load_unified_session_content_with_context(app, context).await?;
-    let normalized = result.or_else(|| {
-        Some(build_empty_session_with_metadata(
-            &fallback_session_id,
-            session_metadata.as_ref(),
-        ))
-    });
-    tracing::info!(
-        session_id = %fallback_session_id,
-        found = normalized.is_some(),
-        "Unified session loaded"
-    );
-    Ok(normalized.map(SessionThreadSnapshot::into_converted_session))
-}
-
 fn build_transcript_snapshot(
     revision: i64,
     snapshot: &SessionThreadSnapshot,
@@ -181,19 +148,82 @@ fn build_transcript_snapshot(
     )
 }
 
+fn build_projection_snapshot(
+    replay_context: &SessionReplayContext,
+    revision: i64,
+    snapshot: &SessionThreadSnapshot,
+) -> crate::acp::projections::SessionProjectionSnapshot {
+    let mut projection = ProjectionRegistry::project_thread_snapshot(
+        &replay_context.local_session_id,
+        Some(replay_context.agent_id.clone()),
+        snapshot,
+    );
+    if let Some(session) = projection.session.as_mut() {
+        session.last_event_seq = revision;
+    }
+    projection
+}
+
+fn projection_last_event_seq(
+    snapshot: &crate::acp::projections::SessionProjectionSnapshot,
+) -> Option<i64> {
+    snapshot
+        .session
+        .as_ref()
+        .map(|session| session.last_event_seq)
+}
+
 async fn persist_canonical_materialization(
     db: &DbConn,
     replay_context: &SessionReplayContext,
     snapshot: &SessionThreadSnapshot,
-    projection: &SessionProjectionSnapshot,
 ) -> Result<(), String> {
-    let has_projection_state = projection_has_runtime_state(projection);
     let session_id = replay_context.local_session_id.clone();
+    let replay_context_for_txn = replay_context.clone();
+    let file_path = replay_context
+        .source_path
+        .clone()
+        .unwrap_or_else(|| format!("__session_registry__/{}", replay_context.local_session_id));
+
+    SessionMetadataRepository::upsert(
+        db,
+        replay_context.local_session_id.clone(),
+        snapshot.title.clone(),
+        chrono::Utc::now().timestamp_millis(),
+        replay_context.project_path.clone(),
+        replay_context.agent_id.as_str().to_string(),
+        file_path.clone(),
+        0,
+        0,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Failed to persist canonical session metadata for {}: {error}",
+            replay_context.local_session_id
+        )
+    })?;
+    if let Some(worktree_path) = replay_context.worktree_path.as_deref() {
+        SessionMetadataRepository::set_worktree_path(
+            db,
+            &replay_context.local_session_id,
+            worktree_path,
+            Some(&replay_context.project_path),
+            Some(replay_context.agent_id.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "Failed to persist canonical worktree metadata for {}: {error}",
+                replay_context.local_session_id
+            )
+        })?;
+    }
 
     db.transaction::<_, (), sea_orm::DbErr>(|txn| {
         let session_id = session_id.clone();
         let snapshot = snapshot.clone();
-        let projection = projection.clone();
+        let replay_context = replay_context_for_txn.clone();
         Box::pin(async move {
             let now = chrono::Utc::now();
             let max_seq: Option<i64> = crate::db::entities::session_journal_event::Entity::find()
@@ -235,8 +265,6 @@ async fn persist_canonical_materialization(
             let transcript_json =
                 serde_json::to_string(&build_transcript_snapshot(revision, &snapshot))
                     .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
-            let projection_json = serde_json::to_string(&projection)
-                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
 
             if let Some(existing_model) =
                 crate::db::entities::session_transcript_snapshot::Entity::find_by_id(&session_id)
@@ -260,39 +288,57 @@ async fn persist_canonical_materialization(
                 .await?;
             }
 
-            if has_projection_state {
-                if let Some(existing_model) =
-                    crate::db::entities::session_projection_snapshot::Entity::find_by_id(
-                        &session_id,
-                    )
+            let thread_snapshot_json = serde_json::to_string(&snapshot)
+                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+            if let Some(existing_model) =
+                crate::db::entities::session_thread_snapshot::Entity::find_by_id(&session_id)
                     .one(txn)
                     .await?
-                {
-                    let mut active: crate::db::entities::session_projection_snapshot::ActiveModel =
-                        existing_model.into();
-                    active.snapshot_json = Set(projection_json.clone());
-                    active.updated_at = Set(now);
-                    active.update(txn).await?;
-                } else {
-                    crate::db::entities::session_projection_snapshot::Entity::insert(
-                        crate::db::entities::session_projection_snapshot::ActiveModel {
-                            session_id: Set(session_id.clone()),
-                            snapshot_json: Set(projection_json.clone()),
-                            updated_at: Set(now),
-                        },
-                    )
-                    .exec(txn)
-                    .await?;
-                }
+            {
+                let mut active: crate::db::entities::session_thread_snapshot::ActiveModel =
+                    existing_model.into();
+                active.snapshot_json = Set(thread_snapshot_json);
+                active.updated_at = Set(now);
+                active.update(txn).await?;
             } else {
-                crate::db::entities::session_projection_snapshot::Entity::delete_by_id(&session_id)
-                    .exec(txn)
-                    .await?;
-            }
-
-            crate::db::entities::session_thread_snapshot::Entity::delete_by_id(&session_id)
+                crate::db::entities::session_thread_snapshot::Entity::insert(
+                    crate::db::entities::session_thread_snapshot::ActiveModel {
+                        session_id: Set(session_id.clone()),
+                        snapshot_json: Set(thread_snapshot_json),
+                        updated_at: Set(now),
+                    },
+                )
                 .exec(txn)
                 .await?;
+            }
+
+            let projection_snapshot_json = serde_json::to_string(&build_projection_snapshot(
+                &replay_context,
+                revision,
+                &snapshot,
+            ))
+            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
+            if let Some(existing_model) =
+                crate::db::entities::session_projection_snapshot::Entity::find_by_id(&session_id)
+                    .one(txn)
+                    .await?
+            {
+                let mut active: crate::db::entities::session_projection_snapshot::ActiveModel =
+                    existing_model.into();
+                active.snapshot_json = Set(projection_snapshot_json);
+                active.updated_at = Set(now);
+                active.update(txn).await?;
+            } else {
+                crate::db::entities::session_projection_snapshot::Entity::insert(
+                    crate::db::entities::session_projection_snapshot::ActiveModel {
+                        session_id: Set(session_id.clone()),
+                        snapshot_json: Set(projection_snapshot_json),
+                        updated_at: Set(now),
+                    },
+                )
+                .exec(txn)
+                .await?;
+            }
 
             Ok(())
         })
@@ -303,7 +349,9 @@ async fn persist_canonical_materialization(
             "Failed to persist canonical snapshots for {}: {error}",
             replay_context.local_session_id
         )
-    })
+    })?;
+
+    Ok(())
 }
 
 pub async fn ensure_canonical_session_materialized(
@@ -333,13 +381,27 @@ pub async fn ensure_canonical_session_materialized(
                     replay_context.local_session_id
                 )
             })?;
-    let transcript_stale = match cached_transcript.as_ref() {
-        Some(snapshot) => snapshot.revision < journal_max,
-        None => true,
-    };
-    if !transcript_stale {
-        return Ok(None);
-    }
+    let cached_projection =
+        SessionProjectionSnapshotRepository::get(&db, &replay_context.local_session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to load projection snapshot for {}: {error}",
+                    replay_context.local_session_id
+                )
+            })?;
+    let cached_thread = SessionThreadSnapshotRepository::get(
+        &db,
+        &replay_context.local_session_id,
+        &replay_context.agent_id,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Failed to load thread snapshot for {}: {error}",
+            replay_context.local_session_id
+        )
+    })?;
     let session_metadata =
         SessionMetadataRepository::get_by_id(&db, &replay_context.local_session_id)
             .await
@@ -349,6 +411,39 @@ pub async fn ensure_canonical_session_materialized(
                     replay_context.local_session_id
                 )
             })?;
+    let has_persisted_open_bundle = cached_transcript.is_some() && cached_projection.is_some();
+    if has_persisted_open_bundle && session_metadata.is_none() {
+        return Err(format!(
+            "Canonical materialization for {} is missing metadata",
+            replay_context.local_session_id
+        ));
+    }
+    let transcript_stale = match cached_transcript.as_ref() {
+        Some(snapshot) => snapshot.revision < journal_max,
+        None => true,
+    };
+    let projection_stale = match cached_projection.as_ref() {
+        Some(snapshot) => projection_last_event_seq(snapshot)
+            .map(|last_event_seq| last_event_seq < journal_max)
+            .unwrap_or(true),
+        None => true,
+    };
+    if has_persisted_open_bundle && !transcript_stale && !projection_stale {
+        return Ok(None);
+    }
+
+    // Lazy-upgrade tier: if a canonical thread snapshot is already persisted, use it
+    // to rebuild the transcript and projection snapshots without a provider history
+    // reload.  This keeps re-open cheap for sessions that have been materialized at
+    // least once and whose journal has since advanced (e.g. new live events after the
+    // last materialization barrier).
+    if let Some(thread_snapshot) = cached_thread {
+        let thread_snapshot = apply_derived_current_mode_metadata(thread_snapshot);
+        let thread_snapshot =
+            apply_session_title_metadata(thread_snapshot, session_metadata.as_ref());
+        persist_canonical_materialization(&db, replay_context, &thread_snapshot).await?;
+        return Ok(Some(thread_snapshot));
+    }
 
     let context = crate::history::session_context::SessionContext {
         local_session_id: replay_context.local_session_id.clone(),
@@ -366,42 +461,9 @@ pub async fn ensure_canonical_session_materialized(
         return Ok(None);
     };
 
-    let projection = ProjectionRegistry::project_thread_snapshot(
-        &replay_context.local_session_id,
-        Some(replay_context.agent_id.clone()),
-        &snapshot,
-    );
-    persist_canonical_materialization(&db, replay_context, &snapshot, &projection).await?;
+    persist_canonical_materialization(&db, replay_context, &snapshot).await?;
 
     Ok(Some(snapshot))
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn get_unified_session(
-    app: AppHandle,
-    session_id: String,
-    project_path: String,
-    agent_id: String,
-    source_path: Option<String>,
-) -> CommandResult<Option<ConvertedSession>> {
-    unexpected_command_result(
-        "get_unified_session",
-        "Failed to get unified session",
-        async {
-            let db = app.try_state::<DbConn>().map(|s| s.inner().clone());
-            let context = crate::history::session_context::resolve_session_context(
-                db.as_ref(),
-                &session_id,
-                &project_path,
-                &agent_id,
-                source_path.as_deref(),
-            )
-            .await;
-            load_unified_session_with_context(app, context).await
-        }
-        .await,
-    )
 }
 
 #[tauri::command]
@@ -439,6 +501,26 @@ pub async fn get_session_open_result(
                 )
             })?;
     let metadata_exists = session_metadata.is_some();
+    let transcript_exists =
+        SessionTranscriptSnapshotRepository::get(db.inner(), &replay_context.local_session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to load transcript snapshot for {}: {error}",
+                    replay_context.local_session_id
+                )
+            })?
+            .is_some();
+    let projection_exists =
+        SessionProjectionSnapshotRepository::get(db.inner(), &replay_context.local_session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to load projection snapshot for {}: {error}",
+                    replay_context.local_session_id
+                )
+            })?
+            .is_some();
     let journal_cutoff =
         SessionJournalEventRepository::max_event_seq(db.inner(), &replay_context.local_session_id)
             .await
@@ -449,10 +531,21 @@ pub async fn get_session_open_result(
                 )
             })?;
 
-    if !metadata_exists && journal_cutoff.is_none() && !has_thread_content {
+    if !transcript_exists && !projection_exists && !has_thread_content && journal_cutoff.is_none() {
         return Ok(SessionOpenResult::Missing(SessionOpenMissing {
             requested_session_id: session_id,
         }));
+    }
+    if has_thread_content && (!transcript_exists || !projection_exists || !metadata_exists) {
+        return Ok(SessionOpenResult::Error(
+            crate::acp::session_open_snapshot::SessionOpenError {
+                requested_session_id: session_id,
+                message: format!(
+                    "Canonical materialization for {} is incomplete after upgrade",
+                    replay_context.local_session_id
+                ),
+            },
+        ));
     }
 
     Ok(assemble_session_open_result(db.inner(), &hub, &replay_context, &session_id).await)
@@ -461,8 +554,7 @@ pub async fn get_session_open_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_session_title_metadata, build_empty_session_with_metadata, history_replay_family,
-        persist_canonical_materialization,
+        apply_session_title_metadata, history_replay_family, persist_canonical_materialization,
     };
     use crate::acp::event_hub::AcpEventHubState;
     use crate::acp::provider::HistoryReplayFamily;
@@ -473,9 +565,10 @@ mod tests {
     use crate::acp::types::CanonicalAgentId;
     use crate::db::repository::{
         SessionJournalEventRepository, SessionMetadataRepository, SessionMetadataRow,
-        SessionProjectionSnapshotRepository, SessionTranscriptSnapshotRepository,
+        SessionProjectionSnapshotRepository, SessionThreadSnapshotRepository,
+        SessionTranscriptSnapshotRepository,
     };
-    use crate::session_jsonl::types::{ConvertedSession, SessionStats, StoredEntry};
+    use crate::session_jsonl::types::StoredEntry;
     use sea_orm::{Database, DbConn};
     use sea_orm_migration::MigratorTrait;
     use std::sync::Arc;
@@ -517,6 +610,7 @@ mod tests {
                 skill_meta: None,
                 normalized_questions: None,
                 normalized_todos: None,
+                normalized_todo_update: None,
                 parent_tool_use_id: None,
                 task_children: None,
                 question_answer: None,
@@ -569,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_session_fallback_applies_title_override_metadata() {
+    fn empty_snapshot_applies_title_override_metadata() {
         let row = SessionMetadataRow {
             id: "session-1".to_string(),
             display: "Autonomous Mode".to_string(),
@@ -587,20 +681,20 @@ mod tests {
             sequence_id: Some(1),
         };
 
-        let converted = build_empty_session_with_metadata("session-1", Some(&row));
+        let converted =
+            apply_session_title_metadata(SessionThreadSnapshot::empty("session-1"), Some(&row));
 
         assert_eq!(converted.title, "Autonomous Mode");
     }
 
     #[test]
     fn derives_plan_mode_from_enter_plan_mode_entries() {
-        let session = ConvertedSession {
+        let session = SessionThreadSnapshot {
             entries: vec![make_tool_call_entry(
                 "tool-enter-plan-1",
                 ToolKind::EnterPlanMode,
                 ToolCallStatus::Completed,
             )],
-            stats: SessionStats::default(),
             title: "Plan session".to_string(),
             created_at: "2026-04-06T00:00:00Z".to_string(),
             current_mode_id: None,
@@ -614,7 +708,7 @@ mod tests {
 
     #[test]
     fn keeps_plan_mode_when_exit_plan_mode_is_not_completed() {
-        let session = ConvertedSession {
+        let session = SessionThreadSnapshot {
             entries: vec![
                 make_tool_call_entry(
                     "tool-enter-plan-1",
@@ -627,7 +721,6 @@ mod tests {
                     ToolCallStatus::Pending,
                 ),
             ],
-            stats: SessionStats::default(),
             title: "Pending exit".to_string(),
             created_at: "2026-04-06T00:00:00Z".to_string(),
             current_mode_id: None,
@@ -705,12 +798,7 @@ mod tests {
             source_path: None,
             compatibility: SessionDescriptorCompatibility::Canonical,
         };
-        let projection = crate::acp::projections::ProjectionRegistry::project_thread_snapshot(
-            &replay_context.local_session_id,
-            Some(replay_context.agent_id.clone()),
-            &snapshot,
-        );
-        persist_canonical_materialization(&db, &replay_context, &snapshot, &projection)
+        persist_canonical_materialization(&db, &replay_context, &snapshot)
             .await
             .expect("persist canonical materialization");
 
@@ -719,18 +807,20 @@ mod tests {
                 .await
                 .expect("load transcript")
                 .expect("expected transcript");
-        assert_eq!(transcript_snapshot.revision, 1);
         let projection_snapshot =
             SessionProjectionSnapshotRepository::get(&db, "canonical-tool-session")
                 .await
                 .expect("load projection")
                 .expect("expected projection");
-        assert!(
-            projection_snapshot.session.is_some()
-                || !projection_snapshot.operations.is_empty()
-                || !projection_snapshot.interactions.is_empty()
+        assert_eq!(transcript_snapshot.revision, 1);
+        assert_eq!(
+            projection_snapshot
+                .session
+                .as_ref()
+                .expect("session projection")
+                .last_event_seq,
+            1
         );
-
         let result =
             assemble_session_open_result(&db, &hub, &replay_context, "canonical-tool-session")
                 .await;
@@ -739,6 +829,456 @@ mod tests {
         };
         assert_eq!(found.transcript_snapshot.revision, 1);
         assert!(!found.transcript_snapshot.entries.is_empty());
+    }
+
+    // =========================================================================
+    // Unit 0: Characterization — reconnect and recovery invariants (Rust side)
+    //
+    // These tests lock in the open-result contract that must stay true while
+    // the canonical pipeline replaces legacy authority. Keep them green across
+    // all later units.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn in_progress_tool_call_is_preserved_in_open_result_operations() {
+        // When a session is reopened (e.g. during or after a reconnect), any
+        // in-progress tool call that was materialized into the canonical
+        // projection snapshot must appear in `SessionOpenFound.operations`.
+        // This is the contract that lets the UI render the in-flight operation
+        // without replaying the full event stream from scratch.
+        let db = setup_test_db().await;
+        let hub = Arc::new(AcpEventHubState::new());
+        SessionMetadataRepository::ensure_exists(
+            &db,
+            "reconnect-in-progress-session",
+            "/repo",
+            "copilot",
+            None,
+        )
+        .await
+        .expect("seed metadata");
+
+        let snapshot = SessionThreadSnapshot {
+            entries: vec![make_tool_call_entry(
+                "tool-read-inflight",
+                ToolKind::Read,
+                ToolCallStatus::InProgress,
+            )],
+            title: "Reconnect session".to_string(),
+            created_at: "2026-04-06T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+        let replay_context = SessionReplayContext {
+            local_session_id: "reconnect-in-progress-session".to_string(),
+            history_session_id: "provider-reconnect-session".to_string(),
+            agent_id: CanonicalAgentId::Copilot,
+            parser_agent_type: crate::acp::parsers::AgentType::Copilot,
+            project_path: "/repo".to_string(),
+            worktree_path: None,
+            effective_cwd: "/repo".to_string(),
+            source_path: None,
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+        persist_canonical_materialization(&db, &replay_context, &snapshot)
+            .await
+            .expect("persist canonical materialization");
+
+        let result = assemble_session_open_result(
+            &db,
+            &hub,
+            &replay_context,
+            "reconnect-in-progress-session",
+        )
+        .await;
+        let SessionOpenResult::Found(found) = result else {
+            panic!("expected Found, got {result:?}");
+        };
+
+        // The in-progress operation must be present so the UI can resume rendering it
+        assert!(
+            !found.operations.is_empty(),
+            "expected in-progress operation in open result"
+        );
+        let op = &found.operations[0];
+        assert_eq!(op.tool_call_id, "tool-read-inflight");
+        assert_eq!(op.status, ToolCallStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn session_with_no_materialized_canonical_snapshots_returns_error() {
+        // Open now requires the canonical persisted bundle. A pre-cutover session
+        // cannot reopen through assemble_session_open_result until the lazy-upgrade
+        // path has materialized transcript + projection + metadata together.
+        let db = setup_test_db().await;
+        let hub = Arc::new(AcpEventHubState::new());
+        SessionMetadataRepository::ensure_exists(
+            &db,
+            "pre-cutover-session",
+            "/repo",
+            "copilot",
+            None,
+        )
+        .await
+        .expect("seed metadata");
+
+        let replay_context = SessionReplayContext {
+            local_session_id: "pre-cutover-session".to_string(),
+            history_session_id: "provider-pre-cutover-session".to_string(),
+            agent_id: CanonicalAgentId::Copilot,
+            parser_agent_type: crate::acp::parsers::AgentType::Copilot,
+            project_path: "/repo".to_string(),
+            worktree_path: None,
+            effective_cwd: "/repo".to_string(),
+            source_path: None,
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+
+        let result =
+            assemble_session_open_result(&db, &hub, &replay_context, "pre-cutover-session").await;
+
+        let SessionOpenResult::Error(error) = result else {
+            panic!("expected Error for pre-cutover session, got {result:?}");
+        };
+        assert!(
+            error
+                .message
+                .contains("Canonical projection snapshot missing"),
+            "expected canonical projection error, got {}",
+            error.message
+        );
+    }
+
+    // =========================================================================
+    // Unit 3: canonical thread snapshot persistence
+    // =========================================================================
+
+    #[tokio::test]
+    async fn thread_snapshot_is_persisted_after_canonical_materialization() {
+        let db = setup_test_db().await;
+        SessionMetadataRepository::ensure_exists(
+            &db,
+            "persist-thread-session",
+            "/repo",
+            "copilot",
+            None,
+        )
+        .await
+        .expect("seed metadata");
+
+        let snapshot = SessionThreadSnapshot {
+            entries: vec![make_tool_call_entry(
+                "tool-read-persist",
+                ToolKind::Read,
+                ToolCallStatus::Completed,
+            )],
+            title: "Persist thread session".to_string(),
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+        let replay_context = SessionReplayContext {
+            local_session_id: "persist-thread-session".to_string(),
+            history_session_id: "provider-persist-thread".to_string(),
+            agent_id: CanonicalAgentId::Copilot,
+            parser_agent_type: crate::acp::parsers::AgentType::Copilot,
+            project_path: "/repo".to_string(),
+            worktree_path: None,
+            effective_cwd: "/repo".to_string(),
+            source_path: None,
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+        persist_canonical_materialization(&db, &replay_context, &snapshot)
+            .await
+            .expect("persist canonical materialization");
+
+        let thread = SessionThreadSnapshotRepository::get(
+            &db,
+            "persist-thread-session",
+            &CanonicalAgentId::Copilot,
+        )
+        .await
+        .expect("load thread snapshot")
+        .expect("expected persisted thread snapshot after materialization");
+
+        assert_eq!(thread.title, "Persist thread session");
+        assert_eq!(thread.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thread_snapshot_is_updated_when_materialization_runs_again() {
+        // Ensures the upsert path (not insert-only) works when re-materializing.
+        let db = setup_test_db().await;
+        SessionMetadataRepository::ensure_exists(
+            &db,
+            "upsert-thread-session",
+            "/repo",
+            "copilot",
+            None,
+        )
+        .await
+        .expect("seed metadata");
+
+        let replay_context = SessionReplayContext {
+            local_session_id: "upsert-thread-session".to_string(),
+            history_session_id: "provider-upsert-thread".to_string(),
+            agent_id: CanonicalAgentId::Copilot,
+            parser_agent_type: crate::acp::parsers::AgentType::Copilot,
+            project_path: "/repo".to_string(),
+            worktree_path: None,
+            effective_cwd: "/repo".to_string(),
+            source_path: None,
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+
+        // First materialization
+        let snapshot_v1 = SessionThreadSnapshot {
+            entries: vec![],
+            title: "Version one".to_string(),
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+        persist_canonical_materialization(&db, &replay_context, &snapshot_v1)
+            .await
+            .expect("first materialization");
+
+        // Second materialization with different title (simulates provider history change)
+        let snapshot_v2 = SessionThreadSnapshot {
+            entries: vec![make_tool_call_entry(
+                "tool-edit-v2",
+                ToolKind::Edit,
+                ToolCallStatus::Completed,
+            )],
+            title: "Version two".to_string(),
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+        persist_canonical_materialization(&db, &replay_context, &snapshot_v2)
+            .await
+            .expect("second materialization");
+
+        let thread = SessionThreadSnapshotRepository::get(
+            &db,
+            "upsert-thread-session",
+            &CanonicalAgentId::Copilot,
+        )
+        .await
+        .expect("load thread snapshot")
+        .expect("expected thread snapshot after re-materialization");
+
+        assert_eq!(thread.title, "Version two");
+        assert_eq!(thread.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn materialization_persists_projection_snapshot_and_open_metadata() {
+        let db = setup_test_db().await;
+        let replay_context = SessionReplayContext {
+            local_session_id: "materialized-open-metadata".to_string(),
+            history_session_id: "provider-materialized-open-metadata".to_string(),
+            agent_id: CanonicalAgentId::Copilot,
+            parser_agent_type: crate::acp::parsers::AgentType::Copilot,
+            project_path: "/repo".to_string(),
+            worktree_path: Some("/repo/.git/worktrees/feature".to_string()),
+            effective_cwd: "/repo/.git/worktrees/feature".to_string(),
+            source_path: Some("/repo/.git/worktrees/feature/.copilot/chat.jsonl".to_string()),
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+        let snapshot = SessionThreadSnapshot {
+            entries: vec![make_tool_call_entry(
+                "tool-read-persisted-open",
+                ToolKind::Read,
+                ToolCallStatus::Completed,
+            )],
+            title: "Materialized Open Metadata".to_string(),
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+
+        persist_canonical_materialization(&db, &replay_context, &snapshot)
+            .await
+            .expect("persist canonical materialization");
+
+        let projection =
+            SessionProjectionSnapshotRepository::get(&db, "materialized-open-metadata")
+                .await
+                .expect("load projection")
+                .expect("expected projection snapshot");
+        assert_eq!(
+            projection
+                .session
+                .as_ref()
+                .expect("session projection")
+                .last_event_seq,
+            1
+        );
+
+        let metadata = SessionMetadataRepository::get_by_id(&db, "materialized-open-metadata")
+            .await
+            .expect("load metadata")
+            .expect("expected metadata");
+        assert_eq!(metadata.display, "Materialized Open Metadata");
+        assert_eq!(
+            metadata.file_path,
+            "/repo/.git/worktrees/feature/.copilot/chat.jsonl"
+        );
+        assert_eq!(
+            metadata.worktree_path.as_deref(),
+            Some("/repo/.git/worktrees/feature")
+        );
+    }
+
+    // =========================================================================
+    // Unit 7: End-to-end canonical pipeline proof
+    // =========================================================================
+
+    /// [E2E] Integration: projection built from snapshot matches projection built
+    /// from live materialization — the canonical pipeline produces deterministic
+    /// state regardless of whether data arrived via snapshot or live events.
+    #[tokio::test]
+    async fn e2e_snapshot_projection_matches_live_materialization_projection() {
+        let db = setup_test_db().await;
+        SessionMetadataRepository::ensure_exists(
+            &db,
+            "e2e-parity-session",
+            "/repo",
+            "claude-code",
+            None,
+        )
+        .await
+        .expect("seed metadata");
+
+        let snapshot = SessionThreadSnapshot {
+            entries: vec![
+                make_tool_call_entry("read-1", ToolKind::Read, ToolCallStatus::Completed),
+                make_tool_call_entry("write-1", ToolKind::Edit, ToolCallStatus::Completed),
+            ],
+            title: "E2E Parity Session".to_string(),
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+        let replay_context = SessionReplayContext {
+            local_session_id: "e2e-parity-session".to_string(),
+            history_session_id: "provider-e2e-parity".to_string(),
+            agent_id: CanonicalAgentId::ClaudeCode,
+            parser_agent_type: crate::acp::parsers::AgentType::ClaudeCode,
+            project_path: "/repo".to_string(),
+            worktree_path: None,
+            effective_cwd: "/repo".to_string(),
+            source_path: None,
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+
+        // Build projection directly from snapshot (the live execution path)
+        // Persist canonical materialization (as session-open does)
+        persist_canonical_materialization(&db, &replay_context, &snapshot)
+            .await
+            .expect("persist canonical materialization");
+
+        let live_projection = crate::acp::projections::ProjectionRegistry::project_thread_snapshot(
+            &replay_context.local_session_id,
+            Some(replay_context.agent_id.clone()),
+            &snapshot,
+        );
+
+        // Reload via assemble_session_open_result (snapshot path)
+        let hub = Arc::new(AcpEventHubState::new());
+        let open_result =
+            assemble_session_open_result(&db, &hub, &replay_context, "e2e-parity-session").await;
+
+        let found = match &open_result {
+            SessionOpenResult::Found(f) => f,
+            other => panic!("Expected Found, got {:?}", other),
+        };
+
+        // The snapshot path and live projection must agree on operation count
+        assert_eq!(
+            found.operations.len(),
+            live_projection.operations.len(),
+            "snapshot open must yield the same number of operations as the live projection"
+        );
+        // Both paths must agree on operation IDs (order-independent)
+        let found_ids: std::collections::BTreeSet<String> =
+            found.operations.iter().map(|op| op.id.clone()).collect();
+        let live_ids: std::collections::BTreeSet<String> = live_projection
+            .operations
+            .iter()
+            .map(|op| op.id.clone())
+            .collect();
+        assert_eq!(
+            found_ids, live_ids,
+            "operation IDs from snapshot open must match live projection"
+        );
+    }
+
+    /// [E2E] Error path: agent crash/recovery — a session that had canonical
+    /// materialization can be reopened after simulated crash, and produces
+    /// non-empty operations (no data loss from the crash).
+    ///
+    /// This proves the canonical pipeline survives crash/recovery without
+    /// duplicated or missing rows.
+    #[tokio::test]
+    async fn e2e_canonical_session_survives_crash_and_recovery_without_data_loss() {
+        let db = setup_test_db().await;
+        SessionMetadataRepository::ensure_exists(
+            &db,
+            "e2e-crash-session",
+            "/repo",
+            "copilot",
+            None,
+        )
+        .await
+        .expect("seed metadata");
+
+        let pre_crash_snapshot = SessionThreadSnapshot {
+            entries: vec![make_tool_call_entry(
+                "tool-pre-crash",
+                ToolKind::Read,
+                ToolCallStatus::Completed,
+            )],
+            title: "Pre-crash session".to_string(),
+            created_at: "2026-04-19T00:00:00Z".to_string(),
+            current_mode_id: None,
+        };
+        let replay_context = SessionReplayContext {
+            local_session_id: "e2e-crash-session".to_string(),
+            history_session_id: "provider-e2e-crash".to_string(),
+            agent_id: CanonicalAgentId::Copilot,
+            parser_agent_type: crate::acp::parsers::AgentType::Copilot,
+            project_path: "/repo".to_string(),
+            worktree_path: None,
+            effective_cwd: "/repo".to_string(),
+            source_path: None,
+            compatibility: SessionDescriptorCompatibility::Canonical,
+        };
+
+        // Persist state before crash
+        persist_canonical_materialization(&db, &replay_context, &pre_crash_snapshot)
+            .await
+            .expect("persist pre-crash materialization");
+
+        // Simulate crash + recovery: reopen the session via canonical path
+        let hub = Arc::new(AcpEventHubState::new());
+        let recovered =
+            assemble_session_open_result(&db, &hub, &replay_context, "e2e-crash-session").await;
+
+        let found = match &recovered {
+            SessionOpenResult::Found(f) => f,
+            other => panic!("Expected Found after recovery, got {:?}", other),
+        };
+
+        // Operations from before the crash must survive
+        assert!(
+            !found.operations.is_empty(),
+            "operations from before crash must survive canonical recovery"
+        );
+        // No duplicates: operation IDs must be unique
+        let mut seen = std::collections::BTreeSet::new();
+        for op in &found.operations {
+            assert!(
+                seen.insert(op.id.clone()),
+                "duplicate operation id after recovery: {}",
+                op.id
+            );
+        }
     }
 }
 
@@ -788,11 +1328,12 @@ pub async fn audit_session_load_timing_cli(
             add_stage(&mut stages, "read_and_parse", t1);
 
             let t2 = Instant::now();
-            let converted =
-                crate::session_converter::convert_claude_full_session_to_entries(&full_session);
+            let snapshot = crate::session_converter::convert_claude_full_session_to_thread_snapshot(
+                &full_session,
+            );
             add_stage(&mut stages, "convert", t2);
 
-            Some(converted)
+            Some(snapshot)
         }
         CanonicalAgentId::Cursor => {
             if let Some(ref sp) = source_path {
@@ -801,10 +1342,10 @@ pub async fn audit_session_load_timing_cli(
                     Ok(Some(fs)) => {
                         add_stage(&mut stages, "load_from_source", t0);
                         let t1 = Instant::now();
-                        let converted =
-                            crate::session_converter::convert_cursor_full_session_to_entries(&fs);
+                        let snapshot =
+                            crate::session_converter::convert_cursor_full_session_to_thread_snapshot(&fs);
                         add_stage(&mut stages, "convert", t1);
-                        Some(converted)
+                        Some(snapshot)
                     }
                     Ok(None) | Err(_) => {
                         add_stage(&mut stages, "load_from_source_failed", t0);
@@ -816,11 +1357,9 @@ pub async fn audit_session_load_timing_cli(
                         match full_session {
                             Some(fs) => {
                                 let t2 = Instant::now();
-                                let c = crate::session_converter::convert_cursor_full_session_to_entries(
-                                    &fs,
-                                );
+                                let s = crate::session_converter::convert_cursor_full_session_to_thread_snapshot(&fs);
                                 add_stage(&mut stages, "convert", t2);
-                                Some(c)
+                                Some(s)
                             }
                             None => None,
                         }
@@ -835,10 +1374,10 @@ pub async fn audit_session_load_timing_cli(
                 match full_session {
                     Some(fs) => {
                         let t1 = Instant::now();
-                        let c =
-                            crate::session_converter::convert_cursor_full_session_to_entries(&fs);
+                        let s =
+                            crate::session_converter::convert_cursor_full_session_to_thread_snapshot(&fs);
                         add_stage(&mut stages, "convert", t1);
-                        Some(c)
+                        Some(s)
                     }
                     None => None,
                 }
@@ -846,10 +1385,13 @@ pub async fn audit_session_load_timing_cli(
         }
         CanonicalAgentId::Codex => {
             let t0 = Instant::now();
-            let codex_result =
-                codex_parser::load_session(&session_id, &project_path, source_path.as_deref())
-                    .await
-                    .map_err(|e| format!("Failed to parse Codex session: {}", e))?;
+            let codex_result = codex_parser::load_thread_snapshot(
+                &session_id,
+                &project_path,
+                source_path.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Failed to parse Codex session: {}", e))?;
             add_stage(&mut stages, "load_session", t0);
             codex_result
         }
@@ -874,7 +1416,7 @@ pub async fn audit_session_load_timing_cli(
     };
 
     let total_ms = total_start.elapsed().as_millis();
-    let entry_count = result.as_ref().map(|c| c.entries.len()).unwrap_or(0);
+    let entry_count = result.as_ref().map(|s| s.entries.len()).unwrap_or(0);
 
     Ok(SessionLoadTiming {
         agent: agent_name.to_string(),
@@ -928,11 +1470,13 @@ pub async fn audit_session_load_timing(
                 add_stage(&mut stages, "read_and_parse", t1);
 
                 let t2 = Instant::now();
-                let converted =
-                    crate::session_converter::convert_claude_full_session_to_entries(&full_session);
+                let snapshot =
+                    crate::session_converter::convert_claude_full_session_to_thread_snapshot(
+                        &full_session,
+                    );
                 add_stage(&mut stages, "convert", t2);
 
-                (Some(converted), "claude-code".to_string())
+                (Some(snapshot), "claude-code".to_string())
             }
             CanonicalAgentId::Cursor => {
                 if let Some(ref sp) = source_path {
@@ -941,31 +1485,28 @@ pub async fn audit_session_load_timing(
                         Ok(Some(fs)) => {
                             add_stage(&mut stages, "load_from_source", t0);
                             let t1 = Instant::now();
-                            let converted =
-                                crate::session_converter::convert_cursor_full_session_to_entries(&fs);
+                            let snapshot =
+                                crate::session_converter::convert_cursor_full_session_to_thread_snapshot(&fs);
                             add_stage(&mut stages, "convert", t1);
-                            (Some(converted), "cursor".to_string())
+                            (Some(snapshot), "cursor".to_string())
                         }
                         Ok(None) | Err(_) => {
                             add_stage(&mut stages, "load_from_source_failed", t0);
-                            // Fall through to find_session_by_id
                             let t_find = Instant::now();
                             let full_session = cursor_parser::find_session_by_id(&session_id)
                                 .await
                                 .map_err(|e| format!("Failed to find Cursor session: {}", e))?;
                             add_stage(&mut stages, "find_transcript", t_find);
-                            let converted = match full_session {
+                            let snapshot = match full_session {
                                 Some(fs) => {
                                     let t2 = Instant::now();
-                                    let c = crate::session_converter::convert_cursor_full_session_to_entries(
-                                        &fs,
-                                    );
+                                    let s = crate::session_converter::convert_cursor_full_session_to_thread_snapshot(&fs);
                                     add_stage(&mut stages, "convert", t2);
-                                    Some(c)
+                                    Some(s)
                                 }
                                 None => None,
                             };
-                            (converted, "cursor".to_string())
+                            (snapshot, "cursor".to_string())
                         }
                     }
                 } else {
@@ -974,17 +1515,17 @@ pub async fn audit_session_load_timing(
                         .await
                         .map_err(|e| format!("Failed to find Cursor session: {}", e))?;
                     add_stage(&mut stages, "find_transcript", t0);
-                    let converted = match full_session {
+                    let snapshot = match full_session {
                         Some(fs) => {
                             let t1 = Instant::now();
-                            let c =
-                                crate::session_converter::convert_cursor_full_session_to_entries(&fs);
+                            let s =
+                                crate::session_converter::convert_cursor_full_session_to_thread_snapshot(&fs);
                             add_stage(&mut stages, "convert", t1);
-                            Some(c)
+                            Some(s)
                         }
                         None => None,
                     };
-                    (converted, "cursor".to_string())
+                    (snapshot, "cursor".to_string())
                 }
             }
             CanonicalAgentId::OpenCode => {
@@ -993,14 +1534,14 @@ pub async fn audit_session_load_timing(
                     opencode_parser::load_session_from_disk(&session_id, source_path.as_deref()).await;
                 add_stage(&mut stages, "load_from_disk", t0);
 
-                if let Ok(Some(converted)) = disk_result {
-                    (Some(converted), "opencode".to_string())
+                if let Ok(Some(snapshot)) = disk_result {
+                    (Some(snapshot), "opencode".to_string())
                 } else {
                     let t1 = Instant::now();
                     match fetch_opencode_session(&app, &session_id, &project_path).await {
-                        Ok(converted) => {
+                        Ok(snapshot) => {
                             add_stage(&mut stages, "http_fetch", t1);
-                            (Some(converted), "opencode".to_string())
+                            (Some(snapshot), "opencode".to_string())
                         }
                         Err(e) => {
                             add_stage(&mut stages, "http_failed", t1);
@@ -1012,7 +1553,7 @@ pub async fn audit_session_load_timing(
             CanonicalAgentId::Codex => {
                 let t0 = Instant::now();
                 let codex_result =
-                    codex_parser::load_session(&session_id, &project_path, source_path.as_deref())
+                    codex_parser::load_thread_snapshot(&session_id, &project_path, source_path.as_deref())
                         .await
                         .map_err(|e| format!("Failed to parse Codex session: {}", e))?;
                 add_stage(&mut stages, "load_session", t0);

@@ -10,7 +10,6 @@ use crate::acp::session_update::{
     ToolCallData, ToolCallStatus, ToolCallUpdateData, ToolKind, ToolReference,
 };
 use crate::acp::types::CanonicalAgentId;
-use crate::session_jsonl::types::ConvertedSession;
 use crate::session_jsonl::types::StoredEntry;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -265,16 +264,6 @@ impl ProjectionRegistry {
         registry.session_projection(session_id)
     }
 
-    #[must_use]
-    pub fn project_converted_session(
-        session_id: &str,
-        agent_id: Option<CanonicalAgentId>,
-        converted: &ConvertedSession,
-    ) -> SessionProjectionSnapshot {
-        let thread_snapshot = SessionThreadSnapshot::from(converted.clone());
-        Self::project_thread_snapshot(session_id, agent_id, &thread_snapshot)
-    }
-
     pub fn remove_session(&self, session_id: &str) {
         self.snapshots.remove(session_id);
         if let Some((_, operation_ids)) = self.session_operation_ids.remove(session_id) {
@@ -392,6 +381,48 @@ impl ProjectionRegistry {
                 snapshot.last_terminal_turn_id = turn_id.clone();
             }
             _ => {}
+        }
+    }
+
+    /// Single canonical entrypoint for applying a live domain event to all read models.
+    ///
+    /// **Idempotency**: if `event.seq > 0` and the session snapshot shows that `event.seq` is
+    /// ≤ `last_event_seq`, the event has already been applied (duplicate delivery or stale
+    /// out-of-order arrival) and is silently dropped.
+    ///
+    /// **Ordering**: after a successful application the session's `last_event_seq` is advanced
+    /// to `event.seq` so subsequent duplicate delivery is rejected.
+    ///
+    /// **Projection bridge**: projection state is applied through `apply_session_update` using
+    /// the paired raw `SessionUpdate`. This is intentional: the canonical domain event payload
+    /// is a sequenced notification (lean identity + status only), not a full snapshot. The raw
+    /// update carries the data needed by the low-level projection reducers (tool arguments,
+    /// title, result, children). The canonical event provides the idempotency/ordering wrapper.
+    pub fn apply_canonical_event(
+        &self,
+        session_id: &str,
+        event: &crate::acp::domain_events::SessionDomainEvent,
+        raw_update: &SessionUpdate,
+    ) {
+        // Idempotency gate: skip if this canonical seq has already been applied.
+        if event.seq > 0 {
+            if let Some(snapshot) = self.snapshots.get(session_id) {
+                if event.seq <= snapshot.last_event_seq {
+                    return;
+                }
+            }
+        }
+
+        // Apply projection state through the existing reducer bridge.
+        self.apply_session_update(session_id, raw_update);
+
+        // Advance last_event_seq to the canonical sequence frontier so future
+        // duplicates are rejected.  This overwrites the auto-incremented value
+        // set by apply_session_update above.
+        if event.seq > 0 {
+            if let Some(mut snapshot) = self.snapshots.get_mut(session_id) {
+                snapshot.last_event_seq = event.seq;
+            }
         }
     }
 
@@ -1022,13 +1053,14 @@ fn mark_tool_call_completed(snapshot: &mut SessionSnapshot, tool_call_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
     use crate::acp::session_update::{
         ContentChunk, ToolArguments, ToolCallData, ToolCallUpdateData, ToolKind,
     };
     use crate::acp::types::ContentBlock;
     use crate::session_jsonl::types::{
-        ConvertedSession, QuestionAnswer, SessionStats, StoredAssistantChunk,
-        StoredAssistantMessage, StoredContentBlock, StoredEntry, StoredUserMessage,
+        QuestionAnswer, StoredAssistantChunk, StoredAssistantMessage, StoredContentBlock,
+        StoredEntry, StoredUserMessage,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1213,6 +1245,7 @@ mod tests {
             skill_meta: None,
             normalized_questions: None,
             normalized_todos: None,
+            normalized_todo_update: None,
             parent_tool_use_id: None,
             task_children: None,
             question_answer: None,
@@ -1309,6 +1342,7 @@ mod tests {
             skill_meta: None,
             normalized_questions: None,
             normalized_todos: None,
+            normalized_todo_update: None,
             parent_tool_use_id: None,
             task_children: None,
             question_answer: None,
@@ -1714,6 +1748,7 @@ mod tests {
                         skill_meta: None,
                         normalized_questions: Some(question_items.clone()),
                         normalized_todos: None,
+                        normalized_todo_update: None,
                         parent_tool_use_id: None,
                         task_children: None,
                         question_answer: Some(QuestionAnswer {
@@ -1740,6 +1775,7 @@ mod tests {
                         skill_meta: None,
                         normalized_questions: None,
                         normalized_todos: None,
+                        normalized_todo_update: None,
                         parent_tool_use_id: None,
                         task_children: None,
                         question_answer: None,
@@ -1790,7 +1826,7 @@ mod tests {
 
     #[test]
     fn project_converted_session_preserves_stored_error_source() {
-        let converted = ConvertedSession {
+        let thread_snapshot = SessionThreadSnapshot {
             entries: vec![StoredEntry::Error {
                 id: "error-1".to_string(),
                 message: crate::session_jsonl::types::StoredErrorMessage {
@@ -1801,14 +1837,11 @@ mod tests {
                 },
                 timestamp: Some("2026-04-15T00:00:00Z".to_string()),
             }],
-            stats: SessionStats::default(),
             title: "Imported error".to_string(),
             created_at: "2026-04-15T00:00:00Z".to_string(),
             current_mode_id: None,
         };
 
-        let thread_snapshot =
-            crate::acp::session_thread_snapshot::SessionThreadSnapshot::from(converted);
         let projection = ProjectionRegistry::project_thread_snapshot(
             "session-1",
             Some(CanonicalAgentId::Codex),
@@ -1830,7 +1863,7 @@ mod tests {
 
     #[test]
     fn project_converted_session_clears_historical_error_when_later_entries_continue() {
-        let converted = ConvertedSession {
+        let thread_snapshot = SessionThreadSnapshot {
             entries: vec![
                 StoredEntry::Error {
                     id: "error-1".to_string(),
@@ -1872,14 +1905,11 @@ mod tests {
                     timestamp: Some("2026-04-15T00:00:02Z".to_string()),
                 },
             ],
-            stats: SessionStats::default(),
             title: "Recovered session".to_string(),
             created_at: "2026-04-15T00:00:00Z".to_string(),
             current_mode_id: None,
         };
 
-        let thread_snapshot =
-            crate::acp::session_thread_snapshot::SessionThreadSnapshot::from(converted);
         let projection = ProjectionRegistry::project_thread_snapshot(
             "session-1",
             Some(CanonicalAgentId::Codex),
@@ -1896,7 +1926,7 @@ mod tests {
 
     #[test]
     fn project_converted_session_defaults_missing_stored_error_source_to_unknown() {
-        let converted = ConvertedSession {
+        let thread_snapshot = SessionThreadSnapshot {
             entries: vec![StoredEntry::Error {
                 id: "error-1".to_string(),
                 message: crate::session_jsonl::types::StoredErrorMessage {
@@ -1907,14 +1937,11 @@ mod tests {
                 },
                 timestamp: Some("2026-04-15T00:00:00Z".to_string()),
             }],
-            stats: SessionStats::default(),
             title: "Imported error".to_string(),
             created_at: "2026-04-15T00:00:00Z".to_string(),
             current_mode_id: None,
         };
 
-        let thread_snapshot =
-            crate::acp::session_thread_snapshot::SessionThreadSnapshot::from(converted);
         let projection = ProjectionRegistry::project_thread_snapshot(
             "session-1",
             Some(CanonicalAgentId::Codex),
@@ -1931,5 +1958,141 @@ mod tests {
                 .map(|failure| failure.source),
             Some(crate::acp::session_update::TurnErrorSource::Unknown)
         );
+    }
+
+    // --- Unit 3: canonical entrypoint idempotency and ordering ---
+
+    fn make_domain_event(
+        seq: i64,
+        session_id: &str,
+    ) -> crate::acp::domain_events::SessionDomainEvent {
+        use crate::acp::domain_events::{SessionDomainEvent, SessionDomainEventKind};
+        SessionDomainEvent {
+            event_id: format!("evt-{seq}"),
+            seq,
+            session_id: session_id.to_string(),
+            provider_session_id: None,
+            occurred_at_ms: 0,
+            causation_id: None,
+            kind: SessionDomainEventKind::AssistantMessageSegmentAppended,
+            payload: None,
+        }
+    }
+
+    fn agent_chunk_update(message_id: &str) -> SessionUpdate {
+        use crate::acp::types::ContentBlock;
+        SessionUpdate::AgentMessageChunk {
+            chunk: ContentChunk {
+                content: ContentBlock::Text {
+                    text: "hi".to_string(),
+                },
+                aggregation_hint: None,
+            },
+            part_id: None,
+            message_id: Some(message_id.to_string()),
+            session_id: None,
+        }
+    }
+
+    /// Happy path: applying canonical events in order advances last_event_seq and state.
+    #[test]
+    fn apply_canonical_event_advances_seq_and_projection() {
+        let registry = ProjectionRegistry::new();
+        registry.register_session("s1".to_string(), CanonicalAgentId::ClaudeCode);
+
+        let event1 = make_domain_event(1, "s1");
+        let event2 = make_domain_event(2, "s1");
+        registry.apply_canonical_event("s1", &event1, &agent_chunk_update("msg-1"));
+        registry.apply_canonical_event("s1", &event2, &agent_chunk_update("msg-2"));
+
+        let snapshot = registry.snapshots.get("s1").unwrap();
+        assert_eq!(
+            snapshot.last_event_seq, 2,
+            "seq must advance to canonical event seq"
+        );
+        assert_eq!(
+            snapshot.message_count, 2,
+            "two message chunks must be projected"
+        );
+    }
+
+    /// Edge case: replaying the same canonical event is idempotent — applying it twice
+    /// produces exactly the same projection state as applying it once.
+    #[test]
+    fn apply_canonical_event_is_idempotent_for_duplicate_delivery() {
+        let registry = ProjectionRegistry::new();
+        registry.register_session("s1".to_string(), CanonicalAgentId::ClaudeCode);
+
+        let event = make_domain_event(5, "s1");
+        registry.apply_canonical_event("s1", &event, &agent_chunk_update("msg-1"));
+        // Second delivery of the same canonical seq must be a no-op.
+        registry.apply_canonical_event("s1", &event, &agent_chunk_update("msg-2"));
+
+        let snapshot = registry.snapshots.get("s1").unwrap();
+        assert_eq!(
+            snapshot.message_count, 1,
+            "duplicate delivery must be dropped"
+        );
+        assert_eq!(
+            snapshot.last_event_seq, 5,
+            "seq must remain at first-applied value"
+        );
+    }
+
+    /// Edge case: a stale (out-of-order) canonical event with a seq below the current
+    /// frontier is rejected without corrupting projection state.
+    #[test]
+    fn apply_canonical_event_rejects_stale_out_of_order_delivery() {
+        let registry = ProjectionRegistry::new();
+        registry.register_session("s1".to_string(), CanonicalAgentId::ClaudeCode);
+
+        // Apply seq=10 first (simulates a later event arriving or state restored from snapshot).
+        let current = make_domain_event(10, "s1");
+        registry.apply_canonical_event("s1", &current, &agent_chunk_update("msg-latest"));
+
+        // Now attempt to apply seq=3 (stale / out-of-order) — must be dropped.
+        let stale = make_domain_event(3, "s1");
+        registry.apply_canonical_event("s1", &stale, &agent_chunk_update("msg-stale"));
+
+        let snapshot = registry.snapshots.get("s1").unwrap();
+        assert_eq!(
+            snapshot.message_count, 1,
+            "stale event must not add to projection"
+        );
+        assert_eq!(snapshot.last_event_seq, 10, "frontier must stay at seq=10");
+    }
+
+    /// Error path: applying a turn-error canonical event leaves the session in a deterministic
+    /// failure state with the active failure preserved for subsequent reads.
+    #[test]
+    fn apply_canonical_event_preserves_turn_failure_state() {
+        use crate::acp::domain_events::{SessionDomainEvent, SessionDomainEventKind};
+        use crate::acp::session_update::TurnErrorData;
+
+        let registry = ProjectionRegistry::new();
+        registry.register_session("s1".to_string(), CanonicalAgentId::ClaudeCode);
+
+        let error_event = SessionDomainEvent {
+            event_id: "evt-err".to_string(),
+            seq: 7,
+            session_id: "s1".to_string(),
+            provider_session_id: None,
+            occurred_at_ms: 0,
+            causation_id: None,
+            kind: SessionDomainEventKind::TurnFailed,
+            payload: None,
+        };
+        let error_update = SessionUpdate::TurnError {
+            error: TurnErrorData::Legacy("quota exceeded".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            session_id: Some("s1".to_string()),
+        };
+
+        registry.apply_canonical_event("s1", &error_event, &error_update);
+
+        let snapshot = registry.snapshots.get("s1").unwrap();
+        assert_eq!(snapshot.turn_state, SessionTurnState::Failed);
+        assert!(snapshot.active_turn_failure.is_some());
+        assert_eq!(snapshot.last_event_seq, 7);
     }
 }

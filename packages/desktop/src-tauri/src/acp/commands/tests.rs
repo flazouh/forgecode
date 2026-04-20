@@ -1,15 +1,25 @@
 use super::inbound_commands::respond_inbound_request_with_registry;
 use super::*;
 use crate::acp::client::{AvailableModel, ResumeSessionResponse, SessionModelState, SessionModes};
+use crate::acp::client_session::default_session_model_state;
 use crate::acp::client_trait::AgentClient;
 use crate::acp::client_transport::InboundRequestResponder;
 use crate::acp::commands::session_commands::{
-    persist_session_metadata_for_cwd, resolve_requested_agent_id, session_metadata_context_from_cwd,
+    build_live_session_state_envelopes, persist_session_metadata_for_cwd,
+    resolve_requested_agent_id, session_metadata_context_from_cwd,
 };
 use crate::acp::error::{AcpError, AcpResult};
+use crate::acp::session_state_engine::{
+    SessionGraphCapabilities, SessionGraphLifecycle, SessionGraphLifecycleStatus,
+    SessionGraphRevision, SessionStateEnvelope, SessionStateGraph, SessionStatePayload,
+};
+use crate::acp::transcript_projection::TranscriptSnapshot;
 use crate::acp::types::CanonicalAgentId;
 use crate::acp::ui_event_dispatcher::{AcpUiEventDispatcher, DispatchPolicy};
 use crate::db::repository::SessionMetadataRepository;
+use crate::db::repository::{
+    SessionProjectionSnapshotRepository, SessionTranscriptSnapshotRepository,
+};
 use async_trait::async_trait;
 use sea_orm::{Database, DbConn};
 use sea_orm_migration::MigratorTrait;
@@ -40,6 +50,12 @@ async fn setup_test_db() -> DbConn {
         .expect("Failed to run migrations");
 
     db
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MockReconnectBehavior {
+    Resume,
+    Load,
 }
 
 #[test]
@@ -224,6 +240,28 @@ async fn persist_session_metadata_for_cwd_inserts_created_worktree_session() {
     );
     assert_eq!(row.agent_id, "claude-code");
     assert!(row.is_transcript_pending());
+
+    let transcript_snapshot = SessionTranscriptSnapshotRepository::get(&db, "session-worktree")
+        .await
+        .expect("load transcript snapshot")
+        .expect("transcript snapshot should exist");
+    assert_eq!(transcript_snapshot.revision, 0);
+    assert!(transcript_snapshot.entries.is_empty());
+
+    let projection_snapshot = SessionProjectionSnapshotRepository::get(&db, "session-worktree")
+        .await
+        .expect("load projection snapshot")
+        .expect("projection snapshot should exist");
+    let session_snapshot = projection_snapshot
+        .session
+        .expect("session projection anchor should exist");
+    assert_eq!(session_snapshot.session_id, "session-worktree");
+    assert_eq!(
+        session_snapshot.agent_id,
+        Some(CanonicalAgentId::ClaudeCode)
+    );
+    assert_eq!(session_snapshot.message_count, 0);
+    assert_eq!(session_snapshot.last_event_seq, 0);
 }
 
 #[tokio::test]
@@ -252,6 +290,19 @@ async fn persist_session_metadata_for_cwd_inserts_created_plain_project_session(
     assert_eq!(row.worktree_path, None);
     assert_eq!(row.agent_id, "claude-code");
     assert!(row.is_transcript_pending());
+
+    assert!(
+        SessionTranscriptSnapshotRepository::get(&db, "session-project")
+            .await
+            .expect("load transcript snapshot")
+            .is_some()
+    );
+    assert!(
+        SessionProjectionSnapshotRepository::get(&db, "session-project")
+            .await
+            .expect("load projection snapshot")
+            .is_some()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -303,7 +354,6 @@ async fn resume_or_create_reuses_existing_client() {
         session_id.clone(),
         cwd,
         agent_id,
-        false,
         None,
         {
             let factory_calls = Arc::clone(&factory_calls);
@@ -344,7 +394,6 @@ async fn resume_or_create_builds_client_when_missing() {
         session_id.clone(),
         cwd,
         agent_id,
-        false,
         None,
         {
             let created_state = created_state.clone();
@@ -369,21 +418,183 @@ async fn resume_or_create_builds_client_when_missing() {
     assert!(session_registry.contains(&session_id));
 }
 
+#[test]
+fn session_state_snapshot_envelope_carries_one_graph_revision_authority() {
+    let graph = SessionStateGraph {
+        requested_session_id: "requested-1".to_string(),
+        canonical_session_id: "canonical-1".to_string(),
+        is_alias: false,
+        agent_id: CanonicalAgentId::Cursor,
+        project_path: "/workspace/a".to_string(),
+        worktree_path: None,
+        source_path: None,
+        revision: SessionGraphRevision::new(11, 3, 11),
+        transcript_snapshot: TranscriptSnapshot {
+            revision: 3,
+            entries: Vec::new(),
+        },
+        operations: Vec::new(),
+        interactions: Vec::new(),
+        turn_state: crate::acp::projections::SessionTurnState::Idle,
+        message_count: 0,
+        active_turn_failure: None,
+        last_terminal_turn_id: None,
+        lifecycle: SessionGraphLifecycle {
+            status: SessionGraphLifecycleStatus::Ready,
+            error_message: None,
+            can_reconnect: true,
+        },
+        capabilities: SessionGraphCapabilities::empty(),
+    };
+
+    let envelope = SessionStateEnvelope {
+        session_id: "canonical-1".to_string(),
+        graph_revision: graph.revision.graph_revision,
+        last_event_seq: graph.revision.last_event_seq,
+        payload: SessionStatePayload::Snapshot {
+            graph: Box::new(graph.clone()),
+        },
+    };
+
+    assert_eq!(envelope.session_id, "canonical-1");
+    assert_eq!(envelope.graph_revision, 11);
+    assert_eq!(envelope.last_event_seq, 11);
+    match envelope.payload {
+        SessionStatePayload::Snapshot {
+            graph: payload_graph,
+        } => {
+            assert_eq!(
+                payload_graph.canonical_session_id,
+                graph.canonical_session_id
+            );
+            assert_eq!(
+                payload_graph.revision.graph_revision,
+                graph.revision.graph_revision
+            );
+        }
+        _ => panic!("expected snapshot payload"),
+    }
+}
+
+#[test]
+fn connection_complete_builds_graph_native_capabilities_and_lifecycle_envelopes() {
+    let update = crate::acp::session_update::SessionUpdate::ConnectionComplete {
+        session_id: "session-1".to_string(),
+        attempt_id: 42,
+        models: SessionModelState {
+            available_models: vec![AvailableModel {
+                model_id: "gpt-5".to_string(),
+                name: "GPT-5".to_string(),
+                description: None,
+            }],
+            current_model_id: "gpt-5".to_string(),
+            ..default_session_model_state()
+        },
+        modes: SessionModes {
+            current_mode_id: "plan".to_string(),
+            available_modes: vec![crate::acp::client::AvailableMode {
+                id: "plan".to_string(),
+                name: "Plan".to_string(),
+                description: None,
+            }],
+        },
+        available_commands: vec![crate::acp::session_update::AvailableCommand {
+            name: "edit".to_string(),
+            description: "Edit files".to_string(),
+            input: None,
+        }],
+        config_options: vec![crate::acp::session_update::ConfigOptionData {
+            id: "sandbox".to_string(),
+            name: "sandbox".to_string(),
+            category: "runtime".to_string(),
+            option_type: "string".to_string(),
+            description: None,
+            current_value: Some(json!("workspace-write")),
+            options: Vec::new(),
+        }],
+        autonomous_enabled: false,
+    };
+
+    let envelopes = build_live_session_state_envelopes(&update, SessionGraphRevision::new(7, 5, 7));
+
+    assert_eq!(envelopes.len(), 2);
+    match &envelopes[0].payload {
+        SessionStatePayload::Capabilities {
+            capabilities,
+            revision,
+        } => {
+            assert_eq!(revision.graph_revision, 7);
+            assert_eq!(revision.transcript_revision, 5);
+            assert_eq!(
+                capabilities
+                    .models
+                    .as_ref()
+                    .expect("models")
+                    .current_model_id,
+                "gpt-5"
+            );
+            assert_eq!(capabilities.available_commands.len(), 1);
+            assert_eq!(capabilities.config_options.len(), 1);
+        }
+        payload => panic!("expected capabilities payload, got {payload:?}"),
+    }
+    match &envelopes[1].payload {
+        SessionStatePayload::Lifecycle {
+            lifecycle,
+            revision,
+        } => {
+            assert_eq!(revision.last_event_seq, 7);
+            assert_eq!(lifecycle.status, SessionGraphLifecycleStatus::Ready);
+            assert_eq!(lifecycle.error_message, None);
+        }
+        payload => panic!("expected lifecycle payload, got {payload:?}"),
+    }
+}
+
+#[test]
+fn connection_failed_builds_graph_native_error_lifecycle_envelope() {
+    let update = crate::acp::session_update::SessionUpdate::ConnectionFailed {
+        session_id: "session-1".to_string(),
+        attempt_id: 42,
+        error: "connection dropped".to_string(),
+    };
+
+    let envelopes = build_live_session_state_envelopes(&update, SessionGraphRevision::new(9, 4, 9));
+
+    assert_eq!(envelopes.len(), 1);
+    match &envelopes[0].payload {
+        SessionStatePayload::Lifecycle {
+            lifecycle,
+            revision,
+        } => {
+            assert_eq!(revision.graph_revision, 9);
+            assert_eq!(revision.transcript_revision, 4);
+            assert_eq!(lifecycle.status, SessionGraphLifecycleStatus::Error);
+            assert_eq!(
+                lifecycle.error_message.as_deref(),
+                Some("connection dropped")
+            );
+            assert!(lifecycle.can_reconnect);
+        }
+        payload => panic!("expected lifecycle payload, got {payload:?}"),
+    }
+}
+
 #[tokio::test]
-async fn resume_or_create_uses_load_for_copilot_sessions() {
+async fn resume_or_create_uses_provider_owned_load_reconnect_behavior() {
     let session_registry = SessionRegistry::new();
     let session_id = "copilot-session".to_string();
     let cwd = "/workspace/a".to_string();
     let agent_id = CanonicalAgentId::Copilot;
 
-    let created_state = MockClientState::new(false);
+    let created_state =
+        MockClientState::new(false).with_reconnect_behavior(MockReconnectBehavior::Load);
 
     let result = resume_or_create_session_client(
         &session_registry,
         session_id.clone(),
         cwd,
         agent_id,
-        false,
         None,
         {
             let created_state = created_state.clone();
@@ -398,7 +609,7 @@ async fn resume_or_create_uses_load_for_copilot_sessions() {
     )
     .await;
 
-    assert!(result.is_ok(), "copilot reconnect should succeed");
+    assert!(result.is_ok(), "load reconnect should succeed");
     assert_eq!(created_state.resume_calls.load(Ordering::SeqCst), 0);
     assert_eq!(created_state.load_calls.load(Ordering::SeqCst), 1);
     assert!(session_registry.contains(&session_id));
@@ -419,7 +630,6 @@ async fn resume_or_create_does_not_store_client_when_new_resume_fails() {
         session_id.clone(),
         cwd,
         agent_id,
-        false,
         None,
         {
             let created_state = created_state.clone();
@@ -609,7 +819,6 @@ async fn resume_or_create_replaces_client_when_existing_resume_fails() {
         session_id.clone(),
         cwd,
         agent_id,
-        false,
         None,
         {
             let replacement_state = replacement_state.clone();
@@ -640,7 +849,7 @@ async fn resume_or_create_replaces_client_when_existing_resume_fails() {
 }
 
 #[tokio::test]
-async fn resume_or_create_forces_replacement_client_and_seeds_launch_mode() {
+async fn resume_or_create_passes_launch_mode_through_provider_owned_reconnect() {
     let session_registry = SessionRegistry::new();
     let session_id = "launch-profile-session".to_string();
     let cwd = "/workspace/a".to_string();
@@ -659,7 +868,6 @@ async fn resume_or_create_forces_replacement_client_and_seeds_launch_mode() {
         session_id.clone(),
         cwd,
         agent_id,
-        true,
         Some("bypassPermissions".to_string()),
         {
             let replacement_state = replacement_state.clone();
@@ -674,15 +882,15 @@ async fn resume_or_create_forces_replacement_client_and_seeds_launch_mode() {
     )
     .await;
 
-    assert!(result.is_ok(), "forced replacement resume should succeed");
-    assert_eq!(existing_state.resume_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(existing_state.stop_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(replacement_state.resume_calls.load(Ordering::SeqCst), 1);
+    assert!(result.is_ok(), "provider-owned reconnect should succeed");
+    assert_eq!(existing_state.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(existing_state.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_state.resume_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        replacement_state
-            .launch_mode_ids
+        existing_state
+            .reconnect_launch_mode_ids
             .lock()
-            .expect("launch mode ids lock")
+            .expect("reconnect launch mode ids lock")
             .as_slice(),
         ["bypassPermissions"]
     );
@@ -755,7 +963,8 @@ struct MockClientState {
     stop_calls: Arc<AtomicUsize>,
     fail_resume: Arc<AtomicBool>,
     fail_load: Arc<AtomicBool>,
-    launch_mode_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    reconnect_behavior: Arc<std::sync::Mutex<MockReconnectBehavior>>,
+    reconnect_launch_mode_ids: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl MockClientState {
@@ -766,8 +975,17 @@ impl MockClientState {
             stop_calls: Arc::new(AtomicUsize::new(0)),
             fail_resume: Arc::new(AtomicBool::new(fail_resume)),
             fail_load: Arc::new(AtomicBool::new(false)),
-            launch_mode_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reconnect_behavior: Arc::new(std::sync::Mutex::new(MockReconnectBehavior::Resume)),
+            reconnect_launch_mode_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    fn with_reconnect_behavior(self, reconnect_behavior: MockReconnectBehavior) -> Self {
+        *self
+            .reconnect_behavior
+            .lock()
+            .expect("reconnect behavior lock") = reconnect_behavior;
+        self
     }
 }
 
@@ -865,6 +1083,32 @@ impl AgentClient for MockAgentClient {
         })
     }
 
+    async fn reconnect_session(
+        &mut self,
+        session_id: String,
+        cwd: String,
+        launch_mode_id: Option<String>,
+    ) -> AcpResult<ResumeSessionResponse> {
+        if let Some(mode_id) = launch_mode_id {
+            self.state
+                .reconnect_launch_mode_ids
+                .lock()
+                .expect("reconnect launch mode ids lock")
+                .push(mode_id);
+        }
+
+        let reconnect_behavior = *self
+            .state
+            .reconnect_behavior
+            .lock()
+            .expect("reconnect behavior lock");
+
+        match reconnect_behavior {
+            MockReconnectBehavior::Resume => self.resume_session(session_id, cwd).await,
+            MockReconnectBehavior::Load => self.load_session(session_id, cwd).await,
+        }
+    }
+
     async fn fork_session(
         &mut self,
         _session_id: String,
@@ -880,11 +1124,6 @@ impl AgentClient for MockAgentClient {
     }
 
     async fn set_session_mode(&mut self, _session_id: String, _mode_id: String) -> AcpResult<()> {
-        self.state
-            .launch_mode_ids
-            .lock()
-            .expect("launch mode ids lock")
-            .push(_mode_id);
         Ok(())
     }
 

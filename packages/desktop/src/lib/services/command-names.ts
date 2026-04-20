@@ -17,7 +17,7 @@ export const COMMANDS = {
     "reply_question": "acp_reply_question",
     "respond_inbound_request": "acp_respond_inbound_request",
     "get_event_bridge_info": "acp_get_event_bridge_info",
-    "get_session_projection": "acp_get_session_projection",
+    "get_session_state": "acp_get_session_state",
     "list_agents": "acp_list_agents",
     "list_preconnection_commands": "acp_list_preconnection_commands",
     "install_agent": "acp_install_agent",
@@ -30,16 +30,11 @@ export const COMMANDS = {
     "write_text_file": "acp_write_text_file"
   },
   "history": {
-    "get_session_history": "get_session_history",
-    "get_session_messages": "get_session_messages",
-    "get_full_session": "get_full_session",
-    "get_converted_session": "get_converted_session",
     "get_cache_stats": "get_cache_stats",
     "invalidate_history_cache": "invalidate_history_cache",
     "reset_cache_stats": "reset_cache_stats",
     "get_index_status": "get_index_status",
     "reindex_sessions": "reindex_sessions",
-    "get_unified_session": "get_unified_session",
     "get_session_open_result": "get_session_open_result",
     "audit_session_load_timing": "audit_session_load_timing",
     "set_session_worktree_path": "set_session_worktree_path",
@@ -58,8 +53,6 @@ export const COMMANDS = {
   },
   "opencode_history": {
     "get_opencode_history": "get_opencode_history",
-    "get_opencode_session": "get_opencode_session",
-    "get_opencode_converted_session": "get_opencode_converted_session",
     "get_opencode_sessions_for_project": "get_opencode_sessions_for_project"
   },
   "storage": {

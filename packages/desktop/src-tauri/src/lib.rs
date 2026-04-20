@@ -37,7 +37,7 @@ use browser_webview::{
 use acp::active_agent::ActiveAgent;
 use acp::commands::{
     acp_cancel, acp_close_session, acp_fork_session, acp_get_event_bridge_info,
-    acp_get_session_projection, acp_initialize, acp_install_agent, acp_list_agents,
+    acp_get_session_state, acp_initialize, acp_install_agent, acp_list_agents,
     acp_list_preconnection_commands, acp_new_session, acp_read_text_file,
     acp_register_custom_agent, acp_reply_interaction, acp_reply_permission, acp_reply_question,
     acp_respond_inbound_request, acp_resume_session, acp_send_prompt, acp_set_config_option,
@@ -62,6 +62,7 @@ use acp::providers::CustomAgentConfig;
 use acp::registry::AgentRegistry;
 use acp::session_policy::SessionPolicyRegistry;
 use acp::session_registry::SessionRegistry;
+use acp::session_state_engine::SessionGraphRuntimeRegistry;
 use acp::transcript_projection::TranscriptProjectionRegistry;
 use checkpoint::commands::{
     checkpoint_create, checkpoint_get_file_content, checkpoint_get_file_diff_content,
@@ -95,19 +96,14 @@ use git::worktree::{
 use git::worktree_config::{load_worktree_config, run_worktree_setup, save_worktree_config};
 use history::commands::{
     audit_session_load_timing, count_sessions_for_project, discover_all_projects_with_sessions,
-    get_session_open_result, get_startup_sessions, get_unified_plan, get_unified_session,
-    list_all_project_paths, scan_project_sessions, set_session_pr_number, set_session_title,
-    set_session_worktree_path,
+    get_session_open_result, get_startup_sessions, get_unified_plan, list_all_project_paths,
+    scan_project_sessions, set_session_pr_number, set_session_title, set_session_worktree_path,
 };
 use history::indexer::IndexerActor;
-use opencode_history::commands::{
-    get_opencode_converted_session, get_opencode_history, get_opencode_session,
-    get_opencode_sessions_for_project,
-};
+use opencode_history::commands::{get_opencode_history, get_opencode_sessions_for_project};
 use pty::commands::get_default_shell;
 use session_jsonl::commands::{
-    get_cache_stats, get_converted_session, get_full_session, get_index_status,
-    get_session_history, get_session_messages, invalidate_history_cache, reindex_sessions,
+    get_cache_stats, get_index_status, invalidate_history_cache, reindex_sessions,
     reset_cache_stats,
 };
 use skills::commands::{
@@ -1005,6 +1001,7 @@ pub fn run() {
             app.manage(SessionRegistry::new());
             app.manage(Arc::new(SessionPolicyRegistry::new()));
             app.manage(Arc::new(ProjectionRegistry::new()));
+            app.manage(Arc::new(SessionGraphRuntimeRegistry::new()));
             app.manage(Arc::new(TranscriptProjectionRegistry::new()));
 
             // Terminal manager for process spawning

@@ -13,6 +13,7 @@ use crate::acp::cursor_extensions::{
 };
 use crate::acp::error::{AcpError, AcpResult};
 use crate::acp::provider_extensions::{InboundResponseAdapter, ProviderExtensionEvent};
+use crate::acp::runtime_resolver::SpawnEnvStrategy;
 use crate::acp::session_descriptor::SessionReplayContext;
 use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::AvailableCommand;
@@ -51,7 +52,8 @@ impl AgentProvider for CursorProvider {
             SpawnConfig {
                 command: "agent".to_string(),
                 args: vec!["acp".to_string()],
-                env: filtered_env(),
+                env: HashMap::new(),
+                env_strategy: Some(filtered_env_strategy()),
             }
         })
     }
@@ -177,8 +179,16 @@ impl AgentProvider for CursorProvider {
         Box::pin(async move { enrich_cursor_session_update(update).await })
     }
 
-    fn uses_task_reconciler(&self) -> bool {
-        self.task_reconciliation_policy().uses_task_reconciler()
+    fn should_filter_session_update_notification(&self, json: &Value) -> bool {
+        is_cursor_extension_pre_tool(json)
+    }
+
+    fn records_web_search_notification_dedup(&self) -> bool {
+        true
+    }
+
+    fn is_web_search_tool_call_id(&self, id: &str) -> bool {
+        id.starts_with("web_search_") || id.starts_with("ws_")
     }
 
     fn task_reconciliation_policy(&self) -> TaskReconciliationPolicy {
@@ -211,10 +221,6 @@ impl AgentProvider for CursorProvider {
         extract_cursor_query_from_synthetic_permission(parsed_arguments, forwarded)
     }
 
-    fn should_suppress_notification(&self, json: &Value) -> bool {
-        is_cursor_extension_pre_tool(json)
-    }
-
     fn load_provider_owned_session<'a>(
         &'a self,
         _app: &'a AppHandle,
@@ -234,20 +240,18 @@ impl AgentProvider for CursorProvider {
                 .await
                 {
                     Ok(Some(full_session)) => Ok(Some(
-                        crate::session_converter::convert_cursor_full_session_to_entries(
+                        crate::session_converter::convert_cursor_full_session_to_thread_snapshot(
                             &full_session,
-                        )
-                        .into(),
+                        ),
                     )),
                     Ok(None) => {
                         match crate::cursor_history::parser::find_session_by_id(lookup_session_id)
                             .await
                         {
                             Ok(Some(full_session)) => Ok(Some(
-                                crate::session_converter::convert_cursor_full_session_to_entries(
+                                crate::session_converter::convert_cursor_full_session_to_thread_snapshot(
                                     &full_session,
-                                )
-                                .into(),
+                                ),
                             )),
                             Ok(None) => Ok(None),
                             Err(error) => {
@@ -271,10 +275,9 @@ impl AgentProvider for CursorProvider {
                             .await
                         {
                             Ok(Some(full_session)) => Ok(Some(
-                                crate::session_converter::convert_cursor_full_session_to_entries(
+                                crate::session_converter::convert_cursor_full_session_to_thread_snapshot(
                                     &full_session,
-                                )
-                                .into(),
+                                ),
                             )),
                             Ok(None) => Ok(None),
                             Err(error) => {
@@ -291,10 +294,9 @@ impl AgentProvider for CursorProvider {
             } else {
                 match crate::cursor_history::parser::find_session_by_id(lookup_session_id).await {
                     Ok(Some(full_session)) => Ok(Some(
-                        crate::session_converter::convert_cursor_full_session_to_entries(
+                        crate::session_converter::convert_cursor_full_session_to_thread_snapshot(
                             &full_session,
-                        )
-                        .into(),
+                        ),
                     )),
                     Ok(None) => Ok(None),
                     Err(error) => {
@@ -346,8 +348,8 @@ const ALLOWED_ENV_KEYS: &[&str] = &[
     "CURSOR_AUTH_TOKEN",
 ];
 
-fn filtered_env() -> HashMap<String, String> {
-    crate::shell_env::build_env(crate::shell_env::EnvStrategy::Allowlist(ALLOWED_ENV_KEYS))
+fn filtered_env_strategy() -> SpawnEnvStrategy {
+    SpawnEnvStrategy::allowlist(ALLOWED_ENV_KEYS)
 }
 
 fn cursor_skills_root() -> Option<PathBuf> {
@@ -487,7 +489,6 @@ fn resolve_cursor_spawn_configs(
     path_agent_available: bool,
 ) -> Vec<SpawnConfig> {
     let mut configs = Vec::new();
-    let env = filtered_env();
 
     if let Some(command) = cached_command {
         push_unique_spawn_config(
@@ -495,7 +496,8 @@ fn resolve_cursor_spawn_configs(
             SpawnConfig {
                 command,
                 args: normalize_cursor_acp_args(cached_args),
-                env: env.clone(),
+                env: HashMap::new(),
+                env_strategy: Some(filtered_env_strategy()),
             },
         );
     }
@@ -506,7 +508,8 @@ fn resolve_cursor_spawn_configs(
             SpawnConfig {
                 command: "agent".to_string(),
                 args: vec!["acp".to_string()],
-                env,
+                env: HashMap::new(),
+                env_strategy: Some(filtered_env_strategy()),
             },
         );
     }
@@ -527,16 +530,19 @@ fn resolve_cursor_model_discovery_commands(launchers: Vec<SpawnConfig>) -> Vec<S
                 "--print".to_string(),
             ],
             env: launcher.env.clone(),
+            env_strategy: launcher.env_strategy.clone(),
         });
         attempts.push(SpawnConfig {
             command: launcher.command.clone(),
             args: vec!["--list-models".to_string()],
             env: launcher.env.clone(),
+            env_strategy: launcher.env_strategy.clone(),
         });
         attempts.push(SpawnConfig {
             command: launcher.command,
             args: vec!["models".to_string()],
             env: launcher.env,
+            env_strategy: launcher.env_strategy,
         });
     }
 
@@ -628,7 +634,10 @@ mod tests {
     #[test]
     fn uses_task_reconciler_for_repeated_tool_call_normalization() {
         let provider = CursorProvider;
-        assert!(provider.uses_task_reconciler());
+        assert_eq!(
+            provider.task_reconciliation_policy(),
+            TaskReconciliationPolicy::ExplicitParentIds
+        );
     }
 
     #[test]

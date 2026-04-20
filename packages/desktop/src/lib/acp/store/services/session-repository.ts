@@ -11,21 +11,17 @@
  * and reduce the God class anti-pattern.
  */
 
-import { okAsync, ResultAsync } from "neverthrow";
+import { errAsync, okAsync, ResultAsync } from "neverthrow";
 import type { HistoryEntry } from "../../../services/claude-history-types.js";
-import type { StoredEntry } from "../../../services/converted-session-types.js";
 import { tauriClient } from "../../../utils/tauri-client.js";
-import { convertStoredEntryToSessionEntry } from "../../converters/stored-entry-converter.js";
-import type { AppError } from "../../errors/app-error.js";
-import { processInChunks } from "../../utils/chunked-processor.js";
+import { AgentError, type AppError } from "../../errors/app-error.js";
 import { createLogger } from "../../utils/logger.js";
 import { api } from "../api.js";
 import {
-	deriveSessionTitleFromUserInput,
 	isFallbackSessionTitle,
 	stripArtifactsFromTitle,
 } from "../session-title-policy.js";
-import type { SessionCold, SessionEntry } from "../types.js";
+import type { SessionCold } from "../types.js";
 import type {
 	IConnectionManager,
 	IEntryManager,
@@ -34,22 +30,6 @@ import type {
 } from "./interfaces/index.js";
 
 const logger = createLogger({ id: "session-repository", name: "SessionRepository" });
-
-function deriveTitleFromFirstUserMessage(entries: readonly SessionEntry[]): string | null {
-	const firstUserMessage = entries.find(
-		(entry): entry is SessionEntry & { type: "user" } => entry.type === "user"
-	);
-	if (!firstUserMessage) {
-		return null;
-	}
-
-	const textContent = firstUserMessage.message.chunks
-		.filter((block) => block.type === "text")
-		.map((block) => ("text" in block ? block.text : ""))
-		.join("\n");
-
-	return textContent ? deriveSessionTitleFromUserInput(textContent) : null;
-}
 
 function isReplaceableSessionTitle(title: string | null | undefined): boolean {
 	if (title === null || title === undefined) {
@@ -70,12 +50,15 @@ function isReplaceableSessionTitle(title: string | null | undefined): boolean {
 }
 
 function resolveSessionTitle(
-	derivedTitle: string | null,
 	scannedTitle: string | null,
 	existingTitle: string | null
 ): string | null {
-	if (derivedTitle !== null && derivedTitle !== "") {
-		return derivedTitle;
+	if (
+		existingTitle !== null &&
+		existingTitle !== undefined &&
+		!isReplaceableSessionTitle(existingTitle)
+	) {
+		return existingTitle;
 	}
 
 	if (
@@ -84,14 +67,6 @@ function resolveSessionTitle(
 		!isReplaceableSessionTitle(scannedTitle)
 	) {
 		return scannedTitle;
-	}
-
-	if (
-		existingTitle !== null &&
-		existingTitle !== undefined &&
-		!isReplaceableSessionTitle(existingTitle)
-	) {
-		return existingTitle;
 	}
 
 	if (scannedTitle !== null && scannedTitle !== undefined && scannedTitle !== "") {
@@ -109,7 +84,6 @@ function resolveSessionTitle(
  * Repository for session persistence and loading operations.
  */
 export class SessionRepository {
-	private readonly preloadedSourcePaths = new Map<string, string | undefined>();
 
 	constructor(
 		private readonly stateReader: ISessionStateReader,
@@ -269,14 +243,7 @@ export class SessionRepository {
 			const existingSession = existingSessionsMap.get(scannedSession.id);
 
 			if (existingSession) {
-				const derivedTitle = this.entryManager.isPreloaded(scannedSession.id)
-					? deriveTitleFromFirstUserMessage(this.entryManager.getEntries(scannedSession.id))
-					: null;
-				const title = resolveSessionTitle(
-					derivedTitle,
-					scannedSession.title,
-					existingSession.title
-				);
+				const title = resolveSessionTitle(scannedSession.title, existingSession.title);
 
 				// Merge with existing session - update metadata from scan
 				mergedSessions.push({
@@ -409,24 +376,23 @@ export class SessionRepository {
 				return Promise.resolve({ id, success: false as const });
 			}
 
-			return this.preloadSessionDetails(
-				id,
-				session.projectPath,
-				session.agentId,
-				session.sourcePath
-			).match(
-				(result) => {
-					// Update session metadata if title changed
-					if (result.title && result.title !== session.title) {
-						this.stateWriter.updateSession(id, { title: result.title });
+			return api
+				.getSessionOpenResult(id, session.projectPath, session.agentId, session.sourcePath)
+				.andThen((openResult) => {
+					if (openResult.outcome !== "found") {
+						return okAsync({ id, success: false as const });
 					}
-
-					return { id, success: true as const };
-				},
-				() => {
-					return { id, success: false as const };
-				}
-			);
+					this.stateWriter.replaceSessionOpenSnapshot(openResult);
+					const title = openResult.sessionTitle || undefined;
+					if (title && title !== session.title) {
+						this.stateWriter.updateSession(openResult.canonicalSessionId, { title });
+					}
+					return okAsync({ id: openResult.canonicalSessionId, success: true as const });
+				})
+				.match(
+					(result) => result,
+					() => ({ id, success: false as const })
+				);
 		});
 
 		return ResultAsync.fromSafePromise(Promise.all(loadPromises)).map((results) => {
@@ -446,140 +412,6 @@ export class SessionRepository {
 
 			return { loaded, missing };
 		});
-	}
-
-	/**
-	 * Preload full session details from disk.
-	 */
-	preloadSessionDetails(
-		sessionId: string,
-		projectPath: string,
-		agentId: string,
-		sourcePath?: string
-	): ResultAsync<{ entries: SessionEntry[]; title?: string }, AppError> {
-		if (this.entryManager.isPreloaded(sessionId)) {
-			const existingSourcePath = this.preloadedSourcePaths.get(sessionId);
-			if (existingSourcePath === sourcePath) {
-				const existing = this.entryManager.getEntries(sessionId);
-				return okAsync({ entries: existing });
-			}
-
-			logger.info("Reloading preloaded session because sourcePath changed", {
-				sessionId,
-				existingSourcePath,
-				sourcePath,
-			});
-		}
-
-		return api
-			.getSession(sessionId, projectPath, agentId, sourcePath)
-			.andThen((converted) => {
-				const title = converted.title || undefined;
-
-				// For small sessions (< 200 entries), process synchronously for speed
-				if (converted.entries.length < 200) {
-					const entries: SessionEntry[] = converted.entries.map((e: StoredEntry) => {
-						const timestamp = e.timestamp ? new Date(e.timestamp) : new Date();
-						return convertStoredEntryToSessionEntry(e, timestamp);
-					});
-
-					this.entryManager.storeEntriesAndBuildIndex(sessionId, entries);
-					this.preloadedSourcePaths.set(sessionId, sourcePath);
-
-					return okAsync({ entries, title });
-				}
-
-				// For large sessions, use chunked async processing to avoid UI freeze
-				return ResultAsync.fromSafePromise(
-					processInChunks(
-						converted.entries,
-						(e: StoredEntry) => {
-							const timestamp = e.timestamp ? new Date(e.timestamp) : new Date();
-							return convertStoredEntryToSessionEntry(e, timestamp);
-						},
-						100 // Process 100 entries per chunk, yielding between chunks
-					)
-				).map((entries) => {
-					this.entryManager.storeEntriesAndBuildIndex(sessionId, entries);
-					this.preloadedSourcePaths.set(sessionId, sourcePath);
-
-					return { entries, title };
-				});
-			})
-			.mapErr((error) => {
-				logger.warn("Failed to load session content", { sessionId, error });
-				return error;
-			});
-	}
-
-	/**
-	 * Load a session directly by ID with its context.
-	 */
-	loadSessionById(
-		sessionId: string,
-		projectPath: string,
-		agentId: string,
-		sourcePath?: string,
-		worktreePath?: string,
-		setSessionLoading?: (sessionId: string) => void,
-		setSessionLoaded?: (sessionId: string) => void,
-		placeholderTitle?: string
-	): ResultAsync<SessionCold, AppError> {
-		// Guard: already loaded
-		if (this.entryManager.isPreloaded(sessionId)) {
-			const existing = this.stateReader.getSessionCold(sessionId);
-			if (existing) {
-				return okAsync(existing);
-			}
-		}
-
-		// Create a transient loading shell if not in store yet
-		const existing = this.stateReader.getSessionCold(sessionId);
-		const createdLoadingShell = !existing;
-		if (createdLoadingShell) {
-			const now = new Date();
-			const loadingShell: SessionCold = {
-				id: sessionId,
-				projectPath,
-				agentId,
-				worktreePath,
-				title: placeholderTitle ?? "Loading...",
-				updatedAt: now,
-				createdAt: now,
-				sourcePath,
-				sessionLifecycleState: sourcePath ? "persisted" : "created",
-				parentId: null,
-			};
-			this.stateWriter.addSession(loadingShell);
-		}
-
-		// Start content loading in state machine
-		this.connectionManager.sendContentLoad(sessionId);
-
-		setSessionLoading?.(sessionId);
-
-		return this.preloadSessionDetails(sessionId, projectPath, agentId, sourcePath)
-			.map((result) => {
-				// Content loaded successfully
-				this.connectionManager.sendContentLoaded(sessionId);
-				setSessionLoaded?.(sessionId);
-
-				// Update session title - use returned title or fallback to "New Thread"
-				const newTitle = result.title || "New Thread";
-				this.stateWriter.updateSession(sessionId, { title: newTitle });
-
-				return this.stateReader.getSessionCold(sessionId)!;
-			})
-			.mapErr((error) => {
-				// Content loading failed — remove transient loading shell to prevent ghost sessions
-				// that survive mergeHistoryWithExisting indefinitely
-				if (createdLoadingShell) {
-					this.stateWriter.removeSession(sessionId);
-				}
-				this.connectionManager.sendContentLoadError(sessionId);
-				setSessionLoaded?.(sessionId); // Clear loading state
-				return error;
-			});
 	}
 
 	/**
@@ -603,24 +435,13 @@ export class SessionRepository {
 			return okAsync(existing);
 		}
 
-		let finalTitle = title;
-		const entries = this.entryManager.getEntries(id);
-		const derivedTitle = deriveTitleFromFirstUserMessage(entries);
-		if (derivedTitle) {
-			logger.debug("Derived title from first user message", {
-				id,
-				derivedTitle,
-			});
-			finalTitle = derivedTitle;
-		}
-
 		const now = new Date();
 		const session: SessionCold = {
 			id,
 			projectPath,
 			agentId,
 			worktreePath,
-			title: finalTitle,
+			title,
 			updatedAt: now,
 			createdAt: now,
 			sourcePath,
@@ -630,7 +451,7 @@ export class SessionRepository {
 		};
 
 		this.stateWriter.addSession(session);
-		logger.debug("Historical session loaded", { id, titleUsed: finalTitle });
+		logger.debug("Historical session loaded", { id, titleUsed: title });
 
 		return okAsync(session);
 	}
@@ -657,14 +478,7 @@ export class SessionRepository {
 			const existingSession = existingSessionsMap.get(historySession.id);
 
 			if (existingSession && this.entryManager.isPreloaded(existingSession.id)) {
-				const derivedTitle = deriveTitleFromFirstUserMessage(
-					this.entryManager.getEntries(existingSession.id)
-				);
-				const title = resolveSessionTitle(
-					derivedTitle,
-					historySession.title,
-					existingSession.title
-				);
+				const title = resolveSessionTitle(historySession.title, existingSession.title);
 				mergedSessions.push({
 					...existingSession,
 					// Propagate worktreePath from scan if the loading shell was created without it
@@ -683,7 +497,7 @@ export class SessionRepository {
 				});
 				existingSessionsMap.delete(historySession.id);
 			} else if (existingSession) {
-				const title = resolveSessionTitle(null, historySession.title, existingSession.title);
+				const title = resolveSessionTitle(historySession.title, existingSession.title);
 				// Session exists but not preloaded - use history metadata
 				mergedSessions.push({
 					...historySession,

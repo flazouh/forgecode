@@ -6,6 +6,7 @@ use crate::acp::client_session::{SessionModelState, SessionModes};
 use crate::acp::client_trait::CommunicationMode;
 use crate::acp::error::AcpResult;
 use crate::acp::opencode::{OpenCodeHttpClient, OpenCodeManagerRegistry};
+use crate::acp::runtime_resolver::SpawnEnvStrategy;
 use crate::acp::session_descriptor::SessionReplayContext;
 use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::AvailableCommand;
@@ -38,8 +39,8 @@ const ALLOWED_ENV_KEYS: &[&str] = &[
     "OPENCODE_API_KEY",
 ];
 
-fn filtered_env() -> HashMap<String, String> {
-    crate::shell_env::build_env(crate::shell_env::EnvStrategy::Allowlist(ALLOWED_ENV_KEYS))
+fn filtered_env_strategy() -> SpawnEnvStrategy {
+    SpawnEnvStrategy::allowlist(ALLOWED_ENV_KEYS)
 }
 
 fn normalize_opencode_serve_args(cached_args: Vec<String>) -> Vec<String> {
@@ -59,7 +60,6 @@ pub(crate) fn resolve_opencode_spawn_configs(
     cached_args: Vec<String>,
 ) -> Vec<SpawnConfig> {
     let mut configs = Vec::new();
-    let env = filtered_env();
 
     if let Some(command) = cached_command {
         push_unique_spawn_config(
@@ -67,7 +67,8 @@ pub(crate) fn resolve_opencode_spawn_configs(
             SpawnConfig {
                 command,
                 args: normalize_opencode_serve_args(cached_args),
-                env,
+                env: HashMap::new(),
+                env_strategy: Some(filtered_env_strategy()),
             },
         );
     }
@@ -103,7 +104,8 @@ impl AgentProvider for OpenCodeProvider {
             SpawnConfig {
                 command: "__acepe_missing_opencode_binary__".to_string(),
                 args: vec!["serve".to_string()],
-                env: filtered_env(),
+                env: HashMap::new(),
+                env_strategy: Some(filtered_env_strategy()),
             }
         })
     }
@@ -175,18 +177,18 @@ impl AgentProvider for OpenCodeProvider {
             let session_id = &context.local_session_id;
             let lookup_session_id = &context.history_session_id;
 
-            let disk_result = crate::opencode_history::parser::load_session_from_disk(
+            let disk_result = crate::opencode_history::parser::load_thread_snapshot_from_disk(
                 lookup_session_id,
                 context.source_path.as_deref(),
             )
             .await;
 
-            if let Ok(Some(converted)) = disk_result {
+            if let Ok(Some(snapshot)) = disk_result {
                 tracing::info!(
                     session_id = %session_id,
                     "Loaded OpenCode session from local disk"
                 );
-                return Ok(Some(converted.into()));
+                return Ok(Some(snapshot));
             }
 
             match &disk_result {
@@ -202,14 +204,14 @@ impl AgentProvider for OpenCodeProvider {
                 _ => unreachable!(),
             }
 
-            match crate::opencode_history::commands::get_opencode_session(
-                app.clone(),
-                lookup_session_id.to_string(),
-                context.effective_project_path.clone(),
+            match crate::opencode_history::commands::fetch_opencode_session(
+                app,
+                lookup_session_id,
+                &context.effective_project_path,
             )
             .await
             {
-                Ok(converted) => Ok(Some(converted.into())),
+                Ok(snapshot) => Ok(Some(snapshot)),
                 Err(error) => {
                     tracing::warn!(
                         session_id = %session_id,

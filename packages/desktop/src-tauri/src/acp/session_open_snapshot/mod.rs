@@ -16,13 +16,15 @@
 //! `last_event_seq` at claim time (Unit 3) ensures it is not delivered twice.
 
 use crate::acp::event_hub::AcpEventHubState;
-use crate::acp::projections::{InteractionSnapshot, OperationSnapshot, SessionTurnState};
+use crate::acp::projections::{
+    InteractionSnapshot, OperationSnapshot, SessionTurnState, TurnFailureSnapshot,
+};
 use crate::acp::session_descriptor::SessionReplayContext;
-use crate::acp::session_journal::load_stored_projection;
 use crate::acp::transcript_projection::TranscriptSnapshot;
 use crate::acp::types::CanonicalAgentId;
 use crate::db::repository::{
-    SessionJournalEventRepository, SessionMetadataRepository, SessionTranscriptSnapshotRepository,
+    SessionJournalEventRepository, SessionMetadataRepository, SessionProjectionSnapshotRepository,
+    SessionTranscriptSnapshotRepository,
 };
 use sea_orm::DbConn;
 use serde::{Deserialize, Serialize};
@@ -100,6 +102,10 @@ pub struct SessionOpenFound {
     pub interactions: Vec<InteractionSnapshot>,
     pub turn_state: SessionTurnState,
     pub message_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_turn_failure: Option<TurnFailureSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_terminal_turn_id: Option<String>,
 }
 
 // ============================================================================
@@ -169,7 +175,8 @@ pub async fn assemble_session_open_result(
     );
 
     // --- 3. Load canonical projection at the proven cutoff ---
-    let projection = match load_stored_projection(db, replay_context).await {
+    let projection = match SessionProjectionSnapshotRepository::get(db, canonical_session_id).await
+    {
         Ok(proj) => proj,
         Err(err) => {
             hub.supersede_reservation(open_token);
@@ -181,21 +188,25 @@ pub async fn assemble_session_open_result(
             });
         }
     };
-
-    let (operations, interactions, turn_state, message_count) = match projection {
-        Some(proj) => {
-            let session_snap = proj.session.as_ref();
-            (
-                proj.operations,
-                proj.interactions,
-                session_snap
-                    .map(|s| s.turn_state.clone())
-                    .unwrap_or(SessionTurnState::Idle),
-                session_snap.map(|s| s.message_count).unwrap_or(0),
-            )
-        }
-        None => (vec![], vec![], SessionTurnState::Idle, 0),
+    let Some(projection) = projection else {
+        hub.supersede_reservation(open_token);
+        return SessionOpenResult::Error(SessionOpenError {
+            requested_session_id: requested_session_id.to_string(),
+            message: format!(
+                "Canonical projection snapshot missing for session {canonical_session_id}"
+            ),
+        });
     };
+
+    let session_snap = projection.session.as_ref();
+    let operations = projection.operations;
+    let interactions = projection.interactions;
+    let turn_state = session_snap
+        .map(|s| s.turn_state.clone())
+        .unwrap_or(SessionTurnState::Idle);
+    let message_count = session_snap.map(|s| s.message_count).unwrap_or(0);
+    let active_turn_failure = session_snap.and_then(|s| s.active_turn_failure.clone());
+    let last_terminal_turn_id = session_snap.and_then(|s| s.last_terminal_turn_id.clone());
 
     // --- 4. Resolve thread content ---
     let transcript_snapshot =
@@ -224,10 +235,26 @@ pub async fn assemble_session_open_result(
                 });
             }
         };
+    let Some(transcript_snapshot) = transcript_snapshot else {
+        hub.supersede_reservation(open_token);
+        return SessionOpenResult::Error(SessionOpenError {
+            requested_session_id: requested_session_id.to_string(),
+            message: format!(
+                "Canonical transcript snapshot missing for session {canonical_session_id}"
+            ),
+        });
+    };
+    let Some(session_metadata) = session_metadata else {
+        hub.supersede_reservation(open_token);
+        return SessionOpenResult::Error(SessionOpenError {
+            requested_session_id: requested_session_id.to_string(),
+            message: format!(
+                "Canonical session metadata missing for session {canonical_session_id}"
+            ),
+        });
+    };
     let session_title =
-        resolve_canonical_session_title(session_metadata.as_ref(), canonical_session_id);
-    let transcript_snapshot = transcript_snapshot
-        .unwrap_or_else(|| TranscriptSnapshot::from_stored_entries(last_event_seq, &[]));
+        resolve_canonical_session_title(Some(&session_metadata), canonical_session_id);
 
     SessionOpenResult::Found(Box::new(SessionOpenFound {
         requested_session_id: requested_session_id.to_string(),
@@ -245,6 +272,8 @@ pub async fn assemble_session_open_result(
         interactions,
         turn_state,
         message_count,
+        active_turn_failure,
+        last_terminal_turn_id,
     }))
 }
 
@@ -294,6 +323,8 @@ pub async fn session_open_result_for_new_session(
         interactions: vec![],
         turn_state: SessionTurnState::Idle,
         message_count: 0,
+        active_turn_failure: None,
+        last_terminal_turn_id: None,
     }))
 }
 
@@ -313,7 +344,7 @@ mod tests {
     use crate::acp::types::CanonicalAgentId;
     use crate::db::repository::{
         SessionJournalEventRepository, SessionMetadataRepository,
-        SessionTranscriptSnapshotRepository,
+        SessionProjectionSnapshotRepository, SessionTranscriptSnapshotRepository,
     };
     use crate::session_jsonl::types::{
         StoredAssistantChunk, StoredAssistantMessage, StoredContentBlock, StoredEntry,
@@ -376,6 +407,7 @@ mod tests {
                 skill_meta: None,
                 normalized_questions: None,
                 normalized_todos: None,
+                normalized_todo_update: None,
                 parent_tool_use_id: None,
                 task_children: None,
                 question_answer: None,
@@ -431,6 +463,31 @@ mod tests {
         )
         .await
         .expect("seed transcript snapshot");
+    }
+
+    async fn seed_projection_snapshot(db: &DbConn, session_id: &str, revision: i64) {
+        SessionProjectionSnapshotRepository::set(
+            db,
+            session_id,
+            &crate::acp::projections::SessionProjectionSnapshot {
+                session: Some(crate::acp::projections::SessionSnapshot {
+                    session_id: session_id.to_string(),
+                    agent_id: Some(CanonicalAgentId::Copilot),
+                    last_event_seq: revision,
+                    turn_state: SessionTurnState::Idle,
+                    message_count: sample_transcript_entries().len() as u64,
+                    last_agent_message_id: Some("assistant-1".to_string()),
+                    active_tool_call_ids: Vec::new(),
+                    completed_tool_call_ids: Vec::new(),
+                    active_turn_failure: None,
+                    last_terminal_turn_id: None,
+                }),
+                operations: Vec::new(),
+                interactions: Vec::new(),
+            },
+        )
+        .await
+        .expect("seed projection snapshot");
     }
 
     // -----------------------------------------------------------------------
@@ -510,6 +567,8 @@ mod tests {
         seed_session_metadata(&db, session_id, "copilot").await;
         append_tool_call_event(&db, session_id).await;
         append_tool_call_event(&db, session_id).await;
+        seed_transcript_snapshot_with_messages(&db, session_id, 2).await;
+        seed_projection_snapshot(&db, session_id, 2).await;
 
         let replay_context = make_copilot_replay_context(session_id);
         let result = assemble_session_open_result(&db, &hub, &replay_context, session_id).await;
@@ -534,6 +593,8 @@ mod tests {
         let alias_id = "provider-alias-xyz";
 
         seed_session_metadata(&db, canonical_id, "copilot").await;
+        seed_transcript_snapshot_with_messages(&db, canonical_id, 0).await;
+        seed_projection_snapshot(&db, canonical_id, 0).await;
 
         let replay_context = make_copilot_replay_context(canonical_id);
         let result = assemble_session_open_result(&db, &hub, &replay_context, alias_id).await;
@@ -555,6 +616,7 @@ mod tests {
         append_tool_call_event(&db, session_id).await;
         append_tool_call_event(&db, session_id).await;
         seed_transcript_snapshot_with_messages(&db, session_id, 2).await;
+        seed_projection_snapshot(&db, session_id, 2).await;
 
         let replay_context = make_copilot_replay_context(session_id);
         let result = assemble_session_open_result(&db, &hub, &replay_context, session_id).await;
@@ -587,6 +649,7 @@ mod tests {
             .await
             .expect("set title override");
         seed_transcript_snapshot_with_messages(&db, session_id, 0).await;
+        seed_projection_snapshot(&db, session_id, 0).await;
 
         let replay_context = make_copilot_replay_context(session_id);
         let result = assemble_session_open_result(&db, &hub, &replay_context, session_id).await;
@@ -616,6 +679,7 @@ mod tests {
         .await
         .expect("seed metadata");
         seed_transcript_snapshot_with_messages(&db, session_id, 0).await;
+        seed_projection_snapshot(&db, session_id, 0).await;
 
         let replay_context = make_copilot_replay_context(session_id);
         let result = assemble_session_open_result(&db, &hub, &replay_context, session_id).await;
@@ -862,6 +926,8 @@ mod tests {
             source_path: Some("/main/repo/.git/worktrees/feature/.copilot/chat.jsonl".to_string()),
             compatibility: SessionDescriptorCompatibility::Canonical,
         };
+        seed_transcript_snapshot_with_messages(&db, session_id, 0).await;
+        seed_projection_snapshot(&db, session_id, 0).await;
 
         let result = assemble_session_open_result(&db, &hub, &replay_context, session_id).await;
 
@@ -876,6 +942,29 @@ mod tests {
         assert_eq!(
             found.source_path.as_deref(),
             Some("/main/repo/.git/worktrees/feature/.copilot/chat.jsonl")
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_canonical_bundle_returns_error_instead_of_best_effort_found() {
+        let db = setup_db().await;
+        let hub = make_hub();
+        let session_id = "partial-open-session";
+        seed_session_metadata(&db, session_id, "copilot").await;
+        seed_transcript_snapshot_with_messages(&db, session_id, 0).await;
+
+        let replay_context = make_copilot_replay_context(session_id);
+        let result = assemble_session_open_result(&db, &hub, &replay_context, session_id).await;
+
+        let SessionOpenResult::Error(error) = result else {
+            panic!("expected Error, got {result:?}");
+        };
+        assert!(
+            error
+                .message
+                .contains("Canonical projection snapshot missing"),
+            "expected explicit canonical projection error, got {}",
+            error.message
         );
     }
 

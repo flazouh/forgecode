@@ -1,11 +1,12 @@
-use crate::acp::parsers::{AgentParser, AgentType, ClaudeCodeParser, OpenCodeParser};
+use crate::acp::parsers::{AgentParser, ClaudeCodeParser, OpenCodeParser};
 use crate::acp::reconciler::session_tool::{classify_raw_tool_call, ToolClassificationHints};
+use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::{tool_call_status_from_str, ToolArguments, ToolCallData};
 use crate::opencode_history::types::{OpenCodeMessage, OpenCodeMessagePart};
 use crate::session_jsonl::display_names::format_model_display_name;
 use crate::session_jsonl::types::{
-    ConvertedSession, SessionStats, StoredAssistantChunk, StoredAssistantMessage,
-    StoredContentBlock, StoredEntry, StoredUserMessage,
+    SessionStats, StoredAssistantChunk, StoredAssistantMessage, StoredContentBlock, StoredEntry,
+    StoredUserMessage,
 };
 use std::collections::HashMap;
 
@@ -59,6 +60,7 @@ fn parse_task_children_from_metadata(
             locations: None,
             normalized_questions: None,
             normalized_todos: None,
+            normalized_todo_update: None,
             parent_tool_use_id: Some(parent_id.to_string()),
             task_children: None,
             question_answer: None,
@@ -70,13 +72,17 @@ fn parse_task_children_from_metadata(
     Some(children)
 }
 
-/// Convert OpenCode messages to ConvertedSession format.
-///
-/// This function converts OpenCode HTTP API messages to the unified
-/// ConvertedSession format used by the frontend.
+/// Convert OpenCode messages to a `SessionThreadSnapshot`.
 pub fn convert_opencode_messages_to_session(
     messages: Vec<OpenCodeMessage>,
-) -> Result<ConvertedSession, String> {
+) -> Result<SessionThreadSnapshot, String> {
+    let (snapshot, _stats) = convert_opencode_messages(messages)?;
+    Ok(snapshot)
+}
+
+fn convert_opencode_messages(
+    messages: Vec<OpenCodeMessage>,
+) -> Result<(SessionThreadSnapshot, SessionStats), String> {
     let mut entries: Vec<StoredEntry> = Vec::new();
     let mut stats = SessionStats {
         total_messages: messages.len(),
@@ -155,13 +161,15 @@ pub fn convert_opencode_messages_to_session(
     // Calculate todo timing from state transitions
     calculate_todo_timing(&mut entries);
 
-    Ok(ConvertedSession {
-        entries,
+    Ok((
+        SessionThreadSnapshot {
+            entries,
+            title,
+            created_at,
+            current_mode_id: None,
+        },
         stats,
-        title,
-        created_at,
-        current_mode_id: None,
-    })
+    ))
 }
 
 /// Convert an OpenCode user message to StoredEntry.
@@ -303,6 +311,7 @@ fn convert_opencode_assistant_message(
                         locations: None,
                         normalized_questions: classified.normalized_questions,
                         normalized_todos: classified.normalized_todos,
+                        normalized_todo_update: classified.normalized_todo_update,
                         parent_tool_use_id: None,
                         task_children,
                         question_answer: None, // OpenCode question answers not yet supported

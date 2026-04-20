@@ -78,6 +78,7 @@ function createStateWriter(state: SessionStoreState): ISessionStateWriter {
 				session.id === id ? { ...session, ...updates } : session
 			);
 		},
+		replaceSessionOpenSnapshot: () => {},
 		removeSession: (sessionId) => {
 			state.sessions = state.sessions.filter((session) => session.id !== sessionId);
 		},
@@ -147,7 +148,7 @@ const connectionManager: IConnectionManager = {
 };
 
 describe("SessionRepository merge placeholder titles", () => {
-	it("uses the first parsed user message as the title on restart", () => {
+	it("does not invent a title from preloaded entry content on restart", () => {
 		const state: SessionStoreState = {
 			sessions: [createSession()],
 			preloadedSessionIds: new Set(["session-12345678"]),
@@ -171,7 +172,7 @@ describe("SessionRepository merge placeholder titles", () => {
 
 		const sessions = mergeHistoryWithExisting([createHistoryEntry()], state.sessions);
 
-		expect(sessions[0]?.title).toBe("Real Restored Title");
+		expect(sessions[0]?.title).toBe("Session session-");
 	});
 
 	it("refreshes sourcePath metadata for preloaded sessions", () => {
@@ -201,7 +202,7 @@ describe("SessionRepository merge placeholder titles", () => {
 		expect(sessions[0]?.sourcePath).toBe("/opencode/storage/session/session-12345678.json");
 	});
 
-	it("keeps the derived first user message when scan still reports a generated session title", () => {
+	it("keeps the existing non-placeholder title when scan still reports a generated session title", () => {
 		const state: SessionStoreState = {
 			sessions: [createSession({ title: "Session 24745d00" })],
 			preloadedSessionIds: new Set(["session-12345678"]),
@@ -218,6 +219,6 @@ describe("SessionRepository merge placeholder titles", () => {
 			createHistoryEntry({ display: "Session 24745d00" }),
 		]);
 
-		expect(state.sessions[0]?.title).toBe("Real Restored Title");
+		expect(state.sessions[0]?.title).toBe("Session 24745d00");
 	});
 });

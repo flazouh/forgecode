@@ -124,8 +124,9 @@ Acepe uses the Compounding Engineering workflow as its engineering operating sys
 5. **Unresolved scope decisions go back to brainstorm.** If `/document-review` surfaces product ambiguity, loop to `/ce:brainstorm`. Do not bury ambiguity in code.
 6. **Headless review for automation.** When reviewing non-interactively: `/document-review mode:headless docs/plans/<plan>.md`.
 7. **Implementation plan requests must use `/ce:plan` first.** When asked to create an implementation plan for Acepe, always use the `ce-plan` skill first. Session `plan.md` may mirror or summarize the CE plan, but it must not replace the `/ce:plan` workflow, even when the request explicitly asks for a session plan file or uses `[[PLAN]]`.
-8. **Prefer skill entry points** over direct subagent invocation. Skills own orchestration, agent selection, and review posture.
-9. **If a skill is unavailable**, follow the same phase manually. Never skip a phase because the skill isn't loaded.
+8. **Acepe `/ce:plan` uses Deep plan posture.** For Acepe software work, treat `/ce:plan` as a request for a **Deep** plan by default. This is plan-depth guidance, not an automatic trigger for the separate "deepen an existing plan" fast path unless the user explicitly asks to deepen an existing plan, for example with `/ce:plan deepen` or `/ce:plan deepen docs/plans/<plan>.md`.
+9. **Prefer skill entry points** over direct subagent invocation. Skills own orchestration, agent selection, and review posture.
+10. **If a skill is unavailable**, follow the same phase manually. Never skip a phase because the skill isn't loaded.
 
 ### TDD Protocol
 
@@ -167,7 +168,7 @@ The agent panel follows a View–Model–Controller split across packages:
 | **Scene** | `AgentPanelScene` (`packages/ui/src/components/agent-panel-scene/`) | Convenience renderer. Maps `AgentPanelSceneModel` to `AgentPanel` shell slots. Accepts snippet overrides for platform content. |
 
 **Key rules:**
-- New UI for the agent panel goes in `@acepe/ui` as a presentational component with prop-based data. Labels as props, not i18n imports.
+- New UI for the agent panel goes in `@acepe/ui` as a presentational component with prop-based data. Pass user-visible copy via props (English strings from the host or literals in shared UI when appropriate).
 - The composer view also follows this rule: composer leaf controls, selector rows, metrics, and dropdown shells live in `@acepe/ui`, while desktop keeps the controller/state adapters in `agent-input-ui.svelte` and related wrappers.
 - `packages/website` renders `@acepe/ui` components with mock data — proves the view layer works independently.
 - Domain controllers (`modified-files-header`, `review-content`) may access domain-specific stores but should compose `@acepe/ui` sub-components for rendering.
@@ -189,5 +190,4 @@ The agent panel follows a View–Model–Controller split across packages:
 - [Svelte 5 Patterns](.agent-guides/svelte.md)
 - [Rust/Tauri Development](.agent-guides/rust-tauri.md)
 - [Neverthrow Error Handling](.agent-guides/neverthrow.md)
-- [i18n (Paraglide)](.agent-guides/i18n.md)
 - [Code Quality](.agent-guides/code-quality.md)

@@ -17,11 +17,15 @@ import type {
 	JsonValue,
 	PlanData,
 	SessionUpdate,
-	ToolCallData,
-	ToolCallUpdateData,
 	UsageTelemetryData,
 } from "../../services/converted-session-types.js";
-import type { SessionModelState, TranscriptDelta } from "../../services/acp-types.js";
+import type {
+	SessionModelState,
+	SessionStateDelta,
+	SessionStateEnvelope,
+	TranscriptDeltaOperation,
+} from "../../services/acp-types.js";
+import { sessionStateDeltaHasAssistantMutation } from "../session-state/session-state-query-service.js";
 import type { AppError } from "../errors/app-error.js";
 import { AgentError } from "../errors/app-error.js";
 import { EventSubscriber } from "../logic/event-subscriber";
@@ -33,15 +37,14 @@ import {
 } from "../types/reply-handler.js";
 import { createLogger } from "../utils/logger.js";
 import { rawStreamingStore } from "./raw-streaming-store.svelte.js";
-import { enrichExistingToolCallFromPermission } from "./services/permission-tool-call-enricher.js";
 import type { SessionEventHandler } from "./session-event-handler.js";
 import type { SessionContextBudget, SessionUsageTelemetry } from "./types.js";
 
 const logger = createLogger({ id: "session-event-service", name: "SessionEventService" });
 
 type PendingSessionEvent =
-	| { kind: "sessionUpdate"; update: SessionUpdate }
-	| { kind: "transcriptDelta"; delta: TranscriptDelta };
+	| { kind: "sessionUpdate"; update: SessionUpdate; envelopeSeq: number | null }
+	| { kind: "sessionState"; envelope: SessionStateEnvelope };
 
 function isJsonObject(value: JsonValue | undefined): value is Record<string, JsonValue> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -81,99 +84,6 @@ function getAssistantAggregationKey(
 	update: Extract<SessionUpdate, { type: "agentMessageChunk" | "agentThoughtChunk" }>
 ): string | undefined {
 	return update.message_id ?? undefined;
-}
-
-function hasToolCallEntry(
-	handler: SessionEventHandler,
-	sessionId: string,
-	toolCallId: string
-): boolean {
-	return handler
-		.getEntries(sessionId)
-		.some((entry) => entry.type === "tool_call" && entry.message.id === toolCallId);
-}
-
-function hashReplayFingerprint(input: string): string {
-	let hash = 2166136261;
-	for (let index = 0; index < input.length; index += 1) {
-		hash ^= input.charCodeAt(index);
-		hash = Math.imul(hash, 16777619);
-	}
-	return `${input.length}:${(hash >>> 0).toString(16)}`;
-}
-
-function serializeToolCallReplayPayload(toolCall: ToolCallData): string {
-	const title = toolCall.title ?? "";
-	const kind = toolCall.kind ?? "none";
-	const rawInputFingerprint = JSON.stringify(toolCall.rawInput ?? null);
-	const argumentsFingerprint = JSON.stringify(toolCall.arguments);
-	const resultFingerprint = JSON.stringify(toolCall.result ?? null);
-	const locationsFingerprint = JSON.stringify(toolCall.locations ?? null);
-	const skillMetaFingerprint = JSON.stringify(toolCall.skillMeta ?? null);
-	const normalizedQuestionsFingerprint = JSON.stringify(toolCall.normalizedQuestions ?? null);
-	const normalizedTodosFingerprint = JSON.stringify(toolCall.normalizedTodos ?? null);
-	const parentToolUseId = toolCall.parentToolUseId ?? "none";
-	const questionAnswerFingerprint = JSON.stringify(toolCall.questionAnswer ?? null);
-	const awaitingPlanApproval = toolCall.awaitingPlanApproval ? "1" : "0";
-	const planApprovalRequestId = toolCall.planApprovalRequestId ?? "none";
-	const taskChildrenFingerprint = createTaskChildrenFingerprint(toolCall.taskChildren);
-	return `${toolCall.id}:${toolCall.name}:${kind}:${toolCall.status}:${title}:${rawInputFingerprint}:${argumentsFingerprint}:${resultFingerprint}:${locationsFingerprint}:${skillMetaFingerprint}:${normalizedQuestionsFingerprint}:${normalizedTodosFingerprint}:${parentToolUseId}:${questionAnswerFingerprint}:${awaitingPlanApproval}:${planApprovalRequestId}:${taskChildrenFingerprint}`;
-}
-
-function serializeTaskChildrenFingerprint(
-	taskChildren: ReadonlyArray<ToolCallData> | null | undefined
-): string {
-	if (!taskChildren || taskChildren.length === 0) {
-		return "none";
-	}
-
-	return taskChildren.map((child) => serializeToolCallReplayPayload(child)).join(",");
-}
-
-function createTaskChildrenFingerprint(
-	taskChildren: ReadonlyArray<ToolCallData> | null | undefined
-): string {
-	if (!taskChildren || taskChildren.length === 0) {
-		return "none";
-	}
-
-	return hashReplayFingerprint(serializeTaskChildrenFingerprint(taskChildren));
-}
-
-function serializeToolCallUpdateReplayPayload(update: ToolCallUpdateData): string {
-	const status = update.status ?? "none";
-	const title = update.title ?? "";
-	const resultFingerprint = JSON.stringify(update.result ?? null);
-	const contentFingerprint = JSON.stringify(update.content ?? null);
-	const rawOutputFingerprint = JSON.stringify(update.rawOutput ?? null);
-	const locationsFingerprint = JSON.stringify(update.locations ?? null);
-	const streamingInputDelta = update.streamingInputDelta ?? "";
-	const normalizedTodosFingerprint = JSON.stringify(update.normalizedTodos ?? null);
-	const normalizedQuestionsFingerprint = JSON.stringify(update.normalizedQuestions ?? null);
-	const streamingArgumentsFingerprint = JSON.stringify(update.streamingArguments ?? null);
-	const argumentsFingerprint = JSON.stringify(update.arguments ?? null);
-	const failureReason = update.failureReason ?? "";
-	return `${update.toolCallId}:${status}:${title}:${resultFingerprint}:${contentFingerprint}:${rawOutputFingerprint}:${locationsFingerprint}:${streamingInputDelta}:${normalizedTodosFingerprint}:${normalizedQuestionsFingerprint}:${streamingArgumentsFingerprint}:${argumentsFingerprint}:${failureReason}`;
-}
-
-function isProcessedToolReplay(
-	handler: SessionEventHandler,
-	sessionId: string,
-	update: SessionUpdate,
-	replayCount: number
-): boolean {
-	if (replayCount <= 1) {
-		return false;
-	}
-
-	switch (update.type) {
-		case "toolCall":
-			return hasToolCallEntry(handler, sessionId, update.tool_call.id);
-		case "toolCallUpdate":
-			return hasToolCallEntry(handler, sessionId, update.update.toolCallId);
-		default:
-			return false;
-	}
 }
 
 function resolveContextBudget(
@@ -235,20 +145,11 @@ interface LifecycleWaiter {
 	timeoutId: ReturnType<typeof setTimeout>;
 }
 
-function shouldBypassDisconnectedBuffer(update: SessionUpdate): boolean {
-	return (
-		update.type === "permissionRequest" ||
-		update.type === "questionRequest" ||
-		update.type === "connectionComplete" ||
-		update.type === "connectionFailed"
-	);
-}
-
 export class SessionEventService {
 	// Event subscriber for session updates
 	private eventSubscriber: EventSubscriber | null = null;
 	private sessionUpdateSubscriptionId: string | null = null;
-	private transcriptDeltaSubscriptionId: string | null = null;
+	private sessionStateSubscriptionId: string | null = null;
 	// Pending events buffer for sessions being created (race condition handling)
 	private pendingEvents = new SvelteMap<string, PendingSessionEvent[]>();
 	private pendingEventTimestamps = new SvelteMap<string, number>();
@@ -272,16 +173,8 @@ export class SessionEventService {
 		"events" | "chunk" | "backlog" | "disconnected",
 		number
 	>();
-	private replayFingerprintState = new SvelteMap<
-		string,
-		{
-			firstSeenMs: number;
-			lastSeenMs: number;
-			count: number;
-		}
-	>();
-	private static readonly REPLAY_FINGERPRINT_TTL_MS = 15 * 60 * 1000;
-	private static readonly REPLAY_CHUNK_DUPLICATE_WINDOW_MS = 3000;
+	private processedSessionUpdateSeqs = new SvelteMap<number, number>();
+	private static readonly PROCESSED_SESSION_UPDATE_TTL_MS = 15 * 60 * 1000;
 
 	// Callbacks for permission/question handling
 	private callbacks: SessionEventServiceCallbacks = {};
@@ -394,36 +287,36 @@ export class SessionEventService {
 		if (
 			this.eventSubscriber &&
 			this.sessionUpdateSubscriptionId &&
-			this.transcriptDeltaSubscriptionId
+			this.sessionStateSubscriptionId
 		) {
 			return okAsync(undefined);
 		}
 		// Recover from a partial/failed initialization attempt.
 		if (
 			this.eventSubscriber &&
-			(!this.sessionUpdateSubscriptionId || !this.transcriptDeltaSubscriptionId)
+			(!this.sessionUpdateSubscriptionId || !this.sessionStateSubscriptionId)
 		) {
 			this.eventSubscriber = null;
 		}
 
 		const subscriber = new EventSubscriber();
 		return subscriber
-			.subscribe((update: SessionUpdate) => {
-				this.handleSessionUpdate(update, handler);
+			.subscribe((update: SessionUpdate, envelopeSeq: number) => {
+				this.handleSessionUpdate(update, handler, envelopeSeq);
 			})
 			.andThen((sessionUpdateId) => {
 				this.sessionUpdateSubscriptionId = sessionUpdateId;
-				return subscriber.subscribeTranscriptDeltas((delta: TranscriptDelta) => {
-					this.handleTranscriptDelta(delta, handler);
+				return subscriber.subscribeSessionState((envelope: SessionStateEnvelope) => {
+					this.handleSessionStateEnvelope(envelope, handler);
 				});
 			})
-			.map((deltaSubscriptionId) => {
+			.map((sessionStateSubscriptionId) => {
 				this.eventSubscriber = subscriber;
-				this.transcriptDeltaSubscriptionId = deltaSubscriptionId;
+				this.sessionStateSubscriptionId = sessionStateSubscriptionId;
 				this.startTelemetryReporter();
 				logger.debug("Session update subscription initialized", {
 					sessionSubscriptionId: this.sessionUpdateSubscriptionId,
-					transcriptSubscriptionId: deltaSubscriptionId,
+					sessionStateSubscriptionId,
 				});
 				return undefined;
 			})
@@ -431,7 +324,7 @@ export class SessionEventService {
 				subscriber.unsubscribe();
 				this.eventSubscriber = null;
 				this.sessionUpdateSubscriptionId = null;
-				this.transcriptDeltaSubscriptionId = null;
+				this.sessionStateSubscriptionId = null;
 				logger.error("Failed to initialize session update subscription", { error });
 				return new AgentError(
 					"initializeSessionUpdates",
@@ -452,7 +345,7 @@ export class SessionEventService {
 			clearTimeout(pendingAssistantFallback.timeoutId);
 		}
 		this.pendingAssistantFallbacks.clear();
-		this.replayFingerprintState.clear();
+		this.processedSessionUpdateSeqs.clear();
 		this.stopTelemetryReporter();
 
 		if (this.eventSubscriber) {
@@ -460,7 +353,7 @@ export class SessionEventService {
 			this.eventSubscriber = null;
 		}
 		this.sessionUpdateSubscriptionId = null;
-		this.transcriptDeltaSubscriptionId = null;
+		this.sessionStateSubscriptionId = null;
 	}
 
 	/**
@@ -473,7 +366,11 @@ export class SessionEventService {
 	private _hangDebugUpdateCount = 0;
 	private _hangDebugStartTime = performance.now();
 
-	handleSessionUpdate(update: SessionUpdate, handler: SessionEventHandler): void {
+	handleSessionUpdate(
+		update: SessionUpdate,
+		handler: SessionEventHandler,
+		envelopeSeq?: number
+	): void {
 		this._hangDebugUpdateCount++;
 		const now = performance.now();
 		if (now - this._hangDebugStartTime > 5000) {
@@ -491,55 +388,6 @@ export class SessionEventService {
 		// Check hot state for connection status — cold state never includes
 		// isConnected/status fields, so we always read from the hot state store.
 		const hotState = session ? handler.getHotState(sessionId) : null;
-		const isDisconnectedSession = hotState?.isConnected === false;
-		const isConnectingSession = hotState?.status === "connecting";
-		const replayStats = this.recordReplayFingerprint(sessionId, update, hotState?.turnState);
-		if (this.shouldDropDuplicateUpdate(update, replayStats, hotState?.turnState)) {
-			logger.warn("Dropping duplicate replayed session update", {
-				sessionId,
-				updateType: update.type,
-				duplicateCount: replayStats.count,
-				duplicateAgeMs: replayStats.sinceLastSeenMs,
-				fingerprint: replayStats.fingerprint,
-			});
-			return;
-		}
-		if (isProcessedToolReplay(handler, sessionId, update, replayStats.count)) {
-			logger.warn("Dropping duplicate tool replay for existing entry", {
-				sessionId,
-				updateType: update.type,
-				duplicateCount: replayStats.count,
-				fingerprint: replayStats.fingerprint,
-			});
-			return;
-		}
-
-		// Buffer events for known disconnected sessions so they can be replayed
-		// when connectSession() calls flushPendingEvents(). This handles the
-		// startup race where ACP events arrive before session reconnection completes.
-		if (isDisconnectedSession && !isConnectingSession && !shouldBypassDisconnectedBuffer(update)) {
-			this.telemetryDisconnectedDrops++;
-			this.warnWithCooldown("disconnected", "Buffered session update while disconnected", {
-				sessionId,
-				updateType: update.type,
-				agentId: session?.agentId,
-				status: hotState?.status,
-			});
-			this.bufferPendingEvent(sessionId, update);
-			return;
-		}
-
-		this.recordInboundEvent();
-
-		// Assistant chunk updates may be superseded by canonical transcript deltas
-		// emitted in the same tick. Keep the startup buffering path, then defer
-		// actual aggregation until after we know whether a delta arrived.
-		if (update.type === "agentMessageChunk" || update.type === "agentThoughtChunk") {
-			if (!this.hasKnownSession(handler, sessionId)) {
-				this.bufferPendingEvent(sessionId, update);
-				return;
-			}
-		}
 
 		if (logger.isLevelEnabled("debug")) {
 			logger.debug("Received session update", {
@@ -549,9 +397,12 @@ export class SessionEventService {
 		}
 
 		// Record raw event for debugging (dev mode only)
-		rawStreamingStore.record(sessionId, update);
-
 		if (update.type === "connectionComplete") {
+			if (this.shouldDropProcessedSessionUpdate(envelopeSeq, sessionId, update.type)) {
+				return;
+			}
+			this.recordInboundEvent();
+			rawStreamingStore.record(sessionId, update);
 			logger.info("Connection complete event received", {
 				sessionId,
 				attemptId: update.attempt_id,
@@ -568,6 +419,11 @@ export class SessionEventService {
 		}
 
 		if (update.type === "connectionFailed") {
+			if (this.shouldDropProcessedSessionUpdate(envelopeSeq, sessionId, update.type)) {
+				return;
+			}
+			this.recordInboundEvent();
+			rawStreamingStore.record(sessionId, update);
 			logger.error("Connection failed event received", {
 				sessionId,
 				attemptId: update.attempt_id,
@@ -584,9 +440,17 @@ export class SessionEventService {
 		const hasSession = this.hasKnownSession(handler, sessionId);
 
 		if (!hasSession) {
-			this.bufferPendingEvent(sessionId, update);
+			this.bufferPendingEvent(sessionId, update, envelopeSeq);
 			return;
 		}
+
+		if (this.shouldDropProcessedSessionUpdate(envelopeSeq, sessionId, update.type)) {
+			return;
+		}
+		this.recordInboundEvent();
+
+		// Record raw event for debugging (dev mode only)
+		rawStreamingStore.record(sessionId, update);
 
 		if (update.type === "agentMessageChunk" || update.type === "agentThoughtChunk") {
 			this.scheduleAssistantFallbackUpdate(sessionId, update, handler, hotState?.turnState);
@@ -638,7 +502,6 @@ export class SessionEventService {
 						always: update.permission.always,
 						tool: update.permission.tool,
 					});
-					enrichExistingToolCallFromPermission(handler, permission);
 					this.callbacks.onPermissionRequest?.(permission);
 				}
 				break;
@@ -686,11 +549,6 @@ export class SessionEventService {
 
 			case "plan":
 				this.callbacks.onPlanUpdate?.(sessionId, update.plan);
-				if (
-					this.shouldTreatPlanAsTurnComplete(update.plan, handler.getHotState(sessionId).turnState)
-				) {
-					handler.handleStreamComplete(sessionId, null);
-				}
 				break;
 
 			case "userMessageChunk":
@@ -720,12 +578,6 @@ export class SessionEventService {
 					})),
 				});
 				handler.updateConfigOptions(sessionId, update.update.configOptions);
-
-				// Backward compat: also sync mode if present
-				const modeOption = update.update.configOptions.find((opt) => opt.category === "mode");
-				if (modeOption && typeof modeOption.currentValue === "string") {
-					handler.updateCurrentMode(sessionId, modeOption.currentValue);
-				}
 				break;
 			}
 
@@ -772,196 +624,44 @@ export class SessionEventService {
 		}
 	}
 
-	handleTranscriptDelta(delta: TranscriptDelta, handler: SessionEventHandler): void {
-		const sessionId = delta.sessionId;
-		const session = handler.getSessionCold(sessionId);
-		const hotState = session ? handler.getHotState(sessionId) : null;
-		const isDisconnectedSession = hotState?.isConnected === false;
-		const isConnectingSession = hotState?.status === "connecting";
-
-		if (isDisconnectedSession && !isConnectingSession) {
-			this.telemetryDisconnectedDrops++;
-			this.warnWithCooldown("disconnected", "Buffered transcript delta while disconnected", {
-				sessionId,
-				snapshotRevision: delta.snapshotRevision,
-				agentId: session?.agentId,
-				status: hotState?.status,
-			});
-			this.bufferPendingTranscriptDelta(sessionId, delta);
-			return;
+	handleSessionStateEnvelope(envelope: SessionStateEnvelope, handler: SessionEventHandler): void {
+		if (
+			envelope.payload.kind === "delta" &&
+			sessionStateDeltaHasAssistantMutation(envelope.payload.delta)
+		) {
+			this.clearPendingAssistantFallback(envelope.sessionId);
 		}
-
-		if (!this.hasKnownSession(handler, sessionId)) {
-			this.bufferPendingTranscriptDelta(sessionId, delta);
-			return;
-		}
-
-		this.recordInboundEvent();
-		if (this.deltaHasAssistantMutation(delta)) {
-			this.clearPendingAssistantFallback(sessionId);
-		}
-		handler.applyTranscriptDelta(sessionId, delta);
+		handler.applySessionStateEnvelope(envelope.sessionId, envelope);
 	}
 
-	private shouldTreatPlanAsTurnComplete(
-		plan: import("../../services/converted-session-types.js").PlanData,
-		turnState: import("./types.js").TurnState
-	): boolean {
-		if (plan.streaming === true) {
-			return false;
-		}
-
-		if (turnState !== "streaming") {
-			return false;
-		}
-
-		return (
-			plan.hasPlan === true ||
-			typeof plan.contentMarkdown === "string" ||
-			typeof plan.content === "string"
-		);
-	}
-
-	private recordReplayFingerprint(
+	private shouldDropProcessedSessionUpdate(
+		envelopeSeq: number | undefined,
 		sessionId: string,
-		update: SessionUpdate,
-		turnState: string | undefined
-	): { count: number; fingerprint: string | null; sinceLastSeenMs: number | null } {
-		const fingerprint = this.createReplayFingerprint(sessionId, update);
-		if (!fingerprint) {
-			return { count: 1, fingerprint: null, sinceLastSeenMs: null };
+		updateType: SessionUpdate["type"]
+	): boolean {
+		if (envelopeSeq === undefined) {
+			return false;
 		}
 
 		const now = this.nowMs();
-		const cutoff = now - SessionEventService.REPLAY_FINGERPRINT_TTL_MS;
-		for (const [key, value] of this.replayFingerprintState.entries()) {
-			if (value.lastSeenMs < cutoff) {
-				this.replayFingerprintState.delete(key);
+		const cutoff = now - SessionEventService.PROCESSED_SESSION_UPDATE_TTL_MS;
+		for (const [seq, processedAtMs] of this.processedSessionUpdateSeqs.entries()) {
+			if (processedAtMs < cutoff) {
+				this.processedSessionUpdateSeqs.delete(seq);
 			}
 		}
 
-		const existing = this.replayFingerprintState.get(fingerprint);
-		if (!existing) {
-			this.replayFingerprintState.set(fingerprint, {
-				firstSeenMs: now,
-				lastSeenMs: now,
-				count: 1,
-			});
-			return { count: 1, fingerprint, sinceLastSeenMs: null };
-		}
-
-		const nextCount = existing.count + 1;
-		const ageMs = Math.max(0, now - existing.firstSeenMs);
-		const sinceLastSeenMs = Math.max(0, now - existing.lastSeenMs);
-		this.replayFingerprintState.set(fingerprint, {
-			firstSeenMs: existing.firstSeenMs,
-			lastSeenMs: now,
-			count: nextCount,
-		});
-
-		if (nextCount === 2 || nextCount === 5 || nextCount % 10 === 0) {
-			logger.warn("Detected duplicate session update fingerprint", {
+		if (this.processedSessionUpdateSeqs.has(envelopeSeq)) {
+			logger.warn("Dropping duplicate session update envelope", {
 				sessionId,
-				updateType: update.type,
-				turnState: turnState ?? "unknown",
-				duplicateCount: nextCount,
-				ageMs,
-				fingerprint,
+				updateType,
+				envelopeSeq,
 			});
-		}
-		return { count: nextCount, fingerprint, sinceLastSeenMs };
-	}
-
-	private isLongTextChunk(update: SessionUpdate): boolean {
-		if (
-			update.type !== "agentMessageChunk" &&
-			update.type !== "agentThoughtChunk" &&
-			update.type !== "userMessageChunk"
-		) {
-			return false;
-		}
-		return update.chunk.content.type === "text" && update.chunk.content.text.trim().length >= 20;
-	}
-
-	private shouldDropDuplicateUpdate(
-		update: SessionUpdate,
-		replayStats: { count: number; sinceLastSeenMs: number | null },
-		turnState: string | undefined
-	): boolean {
-		if (replayStats.count <= 1) {
-			return false;
-		}
-		const isRapidDuplicate =
-			replayStats.sinceLastSeenMs !== null &&
-			replayStats.sinceLastSeenMs <= SessionEventService.REPLAY_CHUNK_DUPLICATE_WINDOW_MS;
-		if (
-			(update.type === "agentMessageChunk" ||
-				update.type === "agentThoughtChunk" ||
-				update.type === "userMessageChunk") &&
-			this.isLongTextChunk(update)
-		) {
-			// Never drop during active streaming — the batcher guarantees unique deltas.
-			// Dedup only applies during replay/reconnect (non-streaming turns).
-			if (turnState === "streaming") {
-				return false;
-			}
-			return isRapidDuplicate;
-		}
-		if (turnState !== undefined && turnState !== "idle") {
-			return false;
+			return true;
 		}
 
-		switch (update.type) {
-			case "availableCommandsUpdate":
-			case "toolCall":
-			case "toolCallUpdate":
-				return true;
-			default:
-				return false;
-		}
-	}
-
-	private createReplayFingerprint(sessionId: string, update: SessionUpdate): string | null {
-		switch (update.type) {
-			case "toolCall": {
-				const payloadFingerprint = hashReplayFingerprint(
-					serializeToolCallReplayPayload(update.tool_call)
-				);
-				return `${sessionId}|toolCall|${update.tool_call.id}|${payloadFingerprint}`;
-			}
-			case "toolCallUpdate": {
-				const payloadFingerprint = hashReplayFingerprint(
-					serializeToolCallUpdateReplayPayload(update.update)
-				);
-				return `${sessionId}|toolCallUpdate|${update.update.toolCallId}|${payloadFingerprint}`;
-			}
-			case "availableCommandsUpdate":
-				return `${sessionId}|availableCommands|${update.update.availableCommands.length}`;
-			case "userMessageChunk": {
-				if (update.chunk.content.type !== "text") {
-					return null;
-				}
-				const text = update.chunk.content.text.trim();
-				if (text.length < 20) {
-					return null;
-				}
-				return `${sessionId}|userMessageChunk|${text.slice(0, 120)}`;
-			}
-			case "agentMessageChunk":
-			case "agentThoughtChunk": {
-				if (update.chunk.content.type !== "text") {
-					return null;
-				}
-				const text = update.chunk.content.text.trim();
-				if (text.length < 20) {
-					return null;
-				}
-				const messageId = update.message_id ?? "none";
-				return `${sessionId}|${update.type}|${messageId}|${text.slice(0, 120)}`;
-			}
-			default:
-				return null;
-		}
+		this.processedSessionUpdateSeqs.set(envelopeSeq, now);
+		return false;
 	}
 
 	/**
@@ -1003,10 +703,14 @@ export class SessionEventService {
 		for (let i = offset; i < end; i++) {
 			const pendingEvent = pending[i];
 			if (pendingEvent.kind === "sessionUpdate") {
-				this.handleSessionUpdate(pendingEvent.update, handler);
+				this.handleSessionUpdate(
+					pendingEvent.update,
+					handler,
+					pendingEvent.envelopeSeq ?? undefined
+				);
 				continue;
 			}
-			this.handleTranscriptDelta(pendingEvent.delta, handler);
+			this.handleSessionStateEnvelope(pendingEvent.envelope, handler);
 		}
 		const chunkDuration = this.nowMs() - chunkStart;
 		this.telemetryMaxReplayChunkDurationMs = Math.max(
@@ -1134,35 +838,25 @@ export class SessionEventService {
 		this.pendingAssistantFallbacks.delete(sessionId);
 	}
 
-	private deltaHasAssistantMutation(delta: TranscriptDelta): boolean {
-		for (const operation of delta.operations) {
-			if (operation.kind === "appendEntry" && operation.entry.role === "assistant") {
-				return true;
-			}
-			if (operation.kind === "appendSegment" && operation.role === "assistant") {
-				return true;
-			}
-			if (operation.kind === "replaceSnapshot") {
-				return true;
-			}
-		}
-		return false;
-	}
-
 	/**
 	 * Buffer event for session that may still be creating (race condition).
 	 */
-	private bufferPendingEvent(sessionId: string, update: SessionUpdate): void {
+	private bufferPendingEvent(
+		sessionId: string,
+		update: SessionUpdate,
+		envelopeSeq?: number
+	): void {
 		this.bufferPending(sessionId, {
 			kind: "sessionUpdate",
 			update,
+			envelopeSeq: envelopeSeq ?? null,
 		});
 	}
 
-	private bufferPendingTranscriptDelta(sessionId: string, delta: TranscriptDelta): void {
+	private bufferPendingSessionState(sessionId: string, envelope: SessionStateEnvelope): void {
 		this.bufferPending(sessionId, {
-			kind: "transcriptDelta",
-			delta,
+			kind: "sessionState",
+			envelope,
 		});
 	}
 
@@ -1201,7 +895,7 @@ export class SessionEventService {
 			type:
 				pendingEvent.kind === "sessionUpdate"
 					? pendingEvent.update.type
-					: "transcriptDelta",
+					: "sessionState",
 			bufferSize: pending.length,
 		});
 	}

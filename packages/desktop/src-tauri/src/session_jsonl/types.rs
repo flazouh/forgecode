@@ -313,10 +313,9 @@ where
 }
 
 // ============================================
-// CONVERTED SESSION TYPES
+// STORED ENTRY TYPES
 // ============================================
-// These types are used for the optimized get_converted_session command
-// which moves conversion from JavaScript to Rust for better performance.
+// These types represent the canonical storage format for session entries.
 
 /// A content block in a user or assistant message.
 /// Simplified version for storage/display.
@@ -413,37 +412,6 @@ pub enum StoredEntry {
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp: Option<String>,
     },
-}
-
-/// Result of converting a full session to stored entries.
-/// Returned by get_converted_session command.
-#[derive(Debug, Clone, Deserialize, Serialize, specta::Type)]
-pub struct ConvertedSession {
-    pub entries: Vec<StoredEntry>,
-    pub stats: SessionStats,
-    pub title: String,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "currentModeId")]
-    pub current_mode_id: Option<String>,
-}
-
-impl ConvertedSession {
-    /// Create an empty session snapshot.
-    ///
-    /// Used when session content cannot be loaded from disk (e.g. worktree cleaned up,
-    /// agent not yet started). Returning an empty session prevents the frontend from
-    /// treating it as "not found" and auto-removing it from the session list.
-    pub fn empty(session_id: &str) -> Self {
-        let short_id = &session_id[..8.min(session_id.len())];
-        Self {
-            entries: vec![],
-            stats: SessionStats::default(),
-            title: format!("Session {short_id}"),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            current_mode_id: None,
-        }
-    }
 }
 
 /// Response wrapper for get_startup_sessions.

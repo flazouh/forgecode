@@ -4,9 +4,10 @@
 //! - claude/cursor/codex use FullSession conversion
 //! - opencode uses OpenCode message conversion
 
+use crate::acp::session_thread_snapshot::SessionThreadSnapshot;
 use crate::acp::session_update::{TodoStatus, ToolCallData, ToolCallStatus, ToolCallUpdateData};
 use crate::opencode_history::types::OpenCodeMessage;
-use crate::session_jsonl::types::{ConvertedSession, FullSession, StoredEntry};
+use crate::session_jsonl::types::{FullSession, StoredEntry};
 use std::collections::HashMap;
 
 mod claude;
@@ -18,22 +19,28 @@ mod opencode;
 #[cfg(test)]
 use fullsession::parse_skill_meta_from_content;
 
-pub fn convert_claude_full_session_to_entries(session: &FullSession) -> ConvertedSession {
-    claude::convert_claude_full_session_to_entries(session)
+pub fn convert_claude_full_session_to_thread_snapshot(
+    session: &FullSession,
+) -> SessionThreadSnapshot {
+    claude::convert_claude_full_session_to_thread_snapshot(session)
 }
 
-pub fn convert_cursor_full_session_to_entries(session: &FullSession) -> ConvertedSession {
-    cursor::convert_cursor_full_session_to_entries(session)
+pub fn convert_cursor_full_session_to_thread_snapshot(
+    session: &FullSession,
+) -> SessionThreadSnapshot {
+    cursor::convert_cursor_full_session_to_thread_snapshot(session)
 }
 
 #[allow(dead_code)]
-pub fn convert_codex_full_session_to_entries(session: &FullSession) -> ConvertedSession {
-    codex::convert_codex_full_session_to_entries(session)
+pub fn convert_codex_full_session_to_thread_snapshot(
+    session: &FullSession,
+) -> SessionThreadSnapshot {
+    codex::convert_codex_full_session_to_thread_snapshot(session)
 }
 
 pub fn convert_opencode_messages_to_session(
     messages: Vec<OpenCodeMessage>,
-) -> Result<ConvertedSession, String> {
+) -> Result<SessionThreadSnapshot, String> {
     opencode::convert_opencode_messages_to_session(messages)
 }
 
@@ -209,11 +216,10 @@ mod tests {
     #[test]
     fn test_convert_basic_session() {
         let full_session = create_test_full_session();
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         assert_eq!(converted.title, "Test Session");
         assert_eq!(converted.entries.len(), 2);
-        assert_eq!(converted.stats.total_messages, 2);
 
         // Check user entry
         match &converted.entries[0] {
@@ -259,7 +265,7 @@ mod tests {
         full_session.stats.tool_uses = 1;
         full_session.stats.tool_results = 1;
 
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         // Should have user, assistant, and tool_call entries
         assert_eq!(converted.entries.len(), 3);
@@ -301,7 +307,7 @@ mod tests {
 
         full_session.stats.thinking_blocks = 1;
 
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         match &converted.entries[1] {
             StoredEntry::Assistant { message, .. } => {
@@ -341,7 +347,7 @@ mod tests {
             source_tool_assistant_uuid: None,
         });
 
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         // Meta message should be skipped
         assert_eq!(converted.entries.len(), 2);
@@ -374,7 +380,7 @@ mod tests {
             },
         );
 
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         // Empty user message should be skipped
         assert_eq!(converted.entries.len(), 2);
@@ -478,9 +484,6 @@ mod tests {
         let converted = convert_opencode_messages_to_session(messages).unwrap();
 
         assert_eq!(converted.entries.len(), 2);
-        assert_eq!(converted.stats.total_messages, 2);
-        assert_eq!(converted.stats.user_messages, 1);
-        assert_eq!(converted.stats.assistant_messages, 1);
 
         // Check user entry
         match &converted.entries[0] {
@@ -549,8 +552,6 @@ mod tests {
         // Note: assistant message has no text, so no assistant entry is created
         // Second user message has only tool result, so no user entry is created
         assert_eq!(converted.entries.len(), 2);
-        assert_eq!(converted.stats.tool_uses, 1);
-        assert_eq!(converted.stats.tool_results, 1);
 
         // Find tool call entry
         let tool_entry = converted
@@ -789,7 +790,7 @@ More content here."#;
         full_session.stats.tool_uses = 1;
         full_session.stats.tool_results = 1;
 
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         // Find the Skill tool call entry
         let skill_entry = converted
@@ -835,7 +836,7 @@ More content here."#;
         full_session.stats.tool_uses = 1;
         full_session.stats.tool_results = 1;
 
-        let converted = convert_claude_full_session_to_entries(&full_session);
+        let converted = convert_claude_full_session_to_thread_snapshot(&full_session);
 
         // Find the Read tool call entry
         let read_entry = converted

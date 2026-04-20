@@ -86,7 +86,7 @@ function createMockEventHandler(): SessionEventHandler {
 		updateCurrentMode: vi.fn(),
 		updateConfigOptions: vi.fn(),
 		updateUsageTelemetry: vi.fn(),
-		applyTranscriptDelta: vi.fn(),
+		applySessionStateEnvelope: vi.fn(),
 	};
 }
 
@@ -172,6 +172,7 @@ describe("SessionConnectionManager.connectSession", () => {
 	const stateWriter: ISessionStateWriter = {
 		addSession: vi.fn(),
 		updateSession: vi.fn(),
+		replaceSessionOpenSnapshot: vi.fn(),
 		removeSession: vi.fn(),
 		setSessions: vi.fn(),
 		setLoading: vi.fn(),
@@ -263,37 +264,6 @@ describe("SessionConnectionManager.connectSession", () => {
 			availableCommands: [{ name: "compact", description: "Compact session" }],
 		});
 		setModel.mockReturnValue(okAsync(undefined));
-	});
-
-	it("skips resume when ACP session is already bound for the thread", async () => {
-		(stateReader.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
-			isConnected: false,
-			isStreaming: false,
-			status: "idle",
-			acpSessionId: sessionId,
-		});
-
-		const manager = createManager({
-			stateReader,
-			stateWriter,
-			hotState,
-			capabilities,
-			entryManager,
-			connectionManager,
-		});
-
-		const result = await manager.connectSession(sessionId, createMockEventHandler());
-		result._unsafeUnwrap();
-
-		expect(resumeSession).not.toHaveBeenCalled();
-		expect(hotState.updateHotState).toHaveBeenCalledWith(
-			sessionId,
-			expect.objectContaining({
-				isConnected: true,
-				status: "ready",
-				connectionError: null,
-			})
-		);
 	});
 
 	it("applies the stored Autonomous profile after reconnecting a disconnected session", async () => {
@@ -400,7 +370,7 @@ describe("SessionConnectionManager.connectSession", () => {
 			projectPath,
 			expect.any(Number),
 			undefined,
-			undefined,
+			"build",
 			undefined
 		);
 		expect(hotState.updateHotState).toHaveBeenCalledWith(
@@ -411,11 +381,7 @@ describe("SessionConnectionManager.connectSession", () => {
 		);
 	});
 
-	it("passes the hydrated launch mode when reconnecting a Copilot session", async () => {
-		(stateReader.getSessionCold as ReturnType<typeof vi.fn>).mockReturnValue({
-			...baseSession,
-			agentId: "copilot",
-		} satisfies SessionCold);
+	it("passes the hydrated launch mode when reconnecting a session", async () => {
 		(stateReader.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
 			isConnected: false,
 			isStreaming: false,
@@ -572,7 +538,7 @@ describe("SessionConnectionManager.connectSession", () => {
 			projectPath,
 			expect.any(Number),
 			undefined,
-			undefined,
+			"build",
 			undefined
 		);
 		expect(hotState.updateHotState).toHaveBeenCalledWith(
@@ -929,7 +895,7 @@ describe("SessionConnectionManager.connectSession", () => {
 		]);
 	});
 
-	it("flushes pending events after lifecycle-driven connect completes", async () => {
+	it("does not rely on reconnect-time pending event flush after lifecycle-driven connect completes", async () => {
 		getSessionModelForMode.mockReturnValue(undefined);
 		const flushSpy = vi.spyOn(SessionEventService.prototype, "flushPendingEvents");
 		const eventHandler = createMockEventHandler();
@@ -946,7 +912,7 @@ describe("SessionConnectionManager.connectSession", () => {
 		const result = await manager.connectSession(sessionId, eventHandler);
 		result._unsafeUnwrap();
 
-		expect(flushSpy).toHaveBeenCalledWith(sessionId, eventHandler);
+		expect(flushSpy).not.toHaveBeenCalled();
 		flushSpy.mockRestore();
 	});
 
@@ -976,6 +942,110 @@ describe("SessionConnectionManager.connectSession", () => {
 			"open-token-123"
 		);
 	});
+
+	// ==========================================================================
+	// U7 E2E proof: delta-only reconnect after canonical open
+	// ==========================================================================
+
+	it("[E2E] reconnect after canonical open still invokes resumeSession with the openToken frontier", async () => {
+		// Proof: reconnect always forwards the openToken boundary to Rust even when the
+		// session already has an acpSessionId. Frontend replay suppression must never
+		// short-circuit the reconnect invoke itself.
+		getSessionModelForMode.mockReturnValue(undefined);
+
+		// Simulate a session that was previously connected (has an acpSessionId in hot state).
+		// The old replay-suppression guard would have skipped the resume call in this case.
+		// Post-U5 this must always proceed to resumeSession.
+		(hotState.getHotState as ReturnType<typeof vi.fn>).mockReturnValue({
+			status: "idle",
+			acpSessionId: "existing-acp-session-id",
+			isConnected: false,
+			connectionError: null,
+			metadata: {},
+		});
+
+		const manager = createManager({
+			stateReader,
+			stateWriter,
+			hotState,
+			capabilities,
+			entryManager,
+			connectionManager,
+		});
+
+		const result = await manager.connectSession(sessionId, createMockEventHandler(), {
+			openToken: "open-token-post-snapshot",
+		});
+		result._unsafeUnwrap();
+
+		// resumeSession MUST be called — no guard should short-circuit it just because
+		// acpSessionId is already set. The reconnect frontier still belongs to the
+		// openToken carried into Rust.
+		expect(resumeSession).toHaveBeenCalledWith(
+			sessionId,
+			projectPath,
+			expect.any(Number),
+			undefined,
+			undefined,
+			"open-token-post-snapshot"
+		);
+	});
+
+	it("[regression] open-token reconnect leaves replay suppression to Rust", async () => {
+		getSessionModelForMode.mockReturnValue(undefined);
+
+		const manager = createManager({
+			stateReader,
+			stateWriter,
+			hotState,
+			capabilities,
+			entryManager,
+			connectionManager,
+		});
+
+		const result = await manager.connectSession(sessionId, createMockEventHandler(), {
+			openToken: "open-token-suppress-replay",
+		});
+		result._unsafeUnwrap();
+
+		expect(resumeSession).toHaveBeenCalledWith(
+			sessionId,
+			projectPath,
+			expect.any(Number),
+			undefined,
+			undefined,
+			"open-token-suppress-replay"
+		);
+	});
+
+	it("surfaces reconnect failures without translating them into resume-specific read-only copy", async () => {
+		getSessionModelForMode.mockReturnValue(undefined);
+		resumeSession.mockReturnValue(okAsync(undefined));
+
+		const manager = createManager({
+			stateReader,
+			stateWriter,
+			hotState,
+			capabilities,
+			entryManager,
+			connectionManager,
+		});
+		vi.spyOn(lastEventService, "waitForLifecycleEvent").mockImplementationOnce(() => ({
+			promise: Promise.reject(new Error("Method not found: session/load")),
+			cancel: vi.fn(),
+		}));
+
+		const result = await manager.connectSession(sessionId, createMockEventHandler());
+
+		expect(result.isErr()).toBe(true);
+		expect(hotState.updateHotState).toHaveBeenCalledWith(sessionId, {
+			status: "error",
+			isConnected: false,
+			availableCommands: [],
+			connectionError: "Method not found: session/load",
+		});
+		expect(connectionManager.sendConnectionError).toHaveBeenCalledWith(sessionId);
+	});
 });
 
 describe("SessionConnectionManager.createSession", () => {
@@ -995,6 +1065,7 @@ describe("SessionConnectionManager.createSession", () => {
 	const stateWriter: ISessionStateWriter = {
 		addSession: vi.fn(),
 		updateSession: vi.fn(),
+		replaceSessionOpenSnapshot: vi.fn(),
 		removeSession: vi.fn(),
 		setSessions: vi.fn(),
 		setLoading: vi.fn(),
@@ -1508,7 +1579,8 @@ describe("SessionConnectionManager.createSession", () => {
 		});
 
 		const result = await manager.createSession({ projectPath, agentId }, createMockEventHandler());
-		const session = result._unsafeUnwrap();
+		const created = result._unsafeUnwrap();
+		const session = created.session;
 
 		expect(stateWriter.addSession).toHaveBeenCalled();
 		expect(session).toEqual(
@@ -1518,6 +1590,7 @@ describe("SessionConnectionManager.createSession", () => {
 				agentId,
 			})
 		);
+		expect(created.sessionOpen).toBeNull();
 	});
 
 	it("applies autonomous execution profile on create when requested before first send", async () => {
@@ -1592,6 +1665,7 @@ describe("SessionConnectionManager autonomous policy", () => {
 	const stateWriter: ISessionStateWriter = {
 		addSession: vi.fn(),
 		updateSession: vi.fn(),
+		replaceSessionOpenSnapshot: vi.fn(),
 		removeSession: vi.fn(),
 		setSessions: vi.fn(),
 		setLoading: vi.fn(),
@@ -2058,6 +2132,7 @@ describe("SessionConnectionManager.cancelStreaming", () => {
 	const stateWriter: ISessionStateWriter = {
 		addSession: vi.fn(),
 		updateSession: vi.fn(),
+		replaceSessionOpenSnapshot: vi.fn(),
 		removeSession: vi.fn(),
 		setSessions: vi.fn(),
 		setLoading: vi.fn(),
@@ -2210,6 +2285,7 @@ describe("SessionConnectionManager.disconnectSession", () => {
 		const stateWriter: ISessionStateWriter = {
 			addSession: vi.fn(),
 			updateSession: vi.fn(),
+			replaceSessionOpenSnapshot: vi.fn(),
 			removeSession: vi.fn(),
 			setSessions: vi.fn(),
 			setLoading: vi.fn(),

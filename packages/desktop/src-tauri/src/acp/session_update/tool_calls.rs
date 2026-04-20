@@ -388,6 +388,7 @@ pub(crate) fn build_tool_call_from_raw(
         skill_meta: None,
         normalized_questions: classified.normalized_questions,
         normalized_todos: classified.normalized_todos,
+        normalized_todo_update: classified.normalized_todo_update,
         parent_tool_use_id: raw.parent_tool_use_id,
         question_answer: None,
         awaiting_plan_approval: false,
@@ -664,10 +665,12 @@ mod tests {
 
     #[test]
     fn empty_raw_input_other_produces_other_arguments() {
+        // "other" kind hint now normalizes to Unclassified (Other is an internal sentinel
+        // that gets promoted to Unclassified at the identity-resolution boundary).
         let tc = build_with_kind_and_title("other", None);
         assert!(
-            matches!(tc.arguments, ToolArguments::Other { .. }),
-            "Expected Other variant, got {:?}",
+            matches!(tc.arguments, ToolArguments::Unclassified { .. }),
+            "Expected Unclassified variant, got {:?}",
             tc.arguments.tool_kind()
         );
     }
@@ -789,6 +792,7 @@ mod tests {
                 skill_meta: None,
                 normalized_questions: None,
                 normalized_todos: None,
+                normalized_todo_update: None,
                 parent_tool_use_id: None,
                 task_children: None,
                 question_answer: None,
