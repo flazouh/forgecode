@@ -151,7 +151,7 @@ impl ProjectRepository {
                 color: Set(assigned_color.clone()),
                 sort_order: Set(0),
                 icon_path: Set(None),
-                show_external_cli_sessions: Set(true),
+                show_external_cli_sessions: Set(false),
             };
 
             Project::insert(project).exec(&txn).await?;
@@ -173,7 +173,7 @@ impl ProjectRepository {
                 color: assigned_color,
                 sort_order: 0,
                 icon_path: None,
-                show_external_cli_sessions: true,
+                show_external_cli_sessions: false,
             }
         };
 

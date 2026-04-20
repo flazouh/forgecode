@@ -134,8 +134,8 @@ mod session_metadata_tests {
         .await
         .expect("create second project");
 
-        assert!(first.show_external_cli_sessions);
-        assert!(second.show_external_cli_sessions);
+        assert!(!first.show_external_cli_sessions);
+        assert!(!second.show_external_cli_sessions);
 
         let visibility_updated =
             ProjectRepository::update_show_external_cli_sessions(&db, &second.path, false)
@@ -931,7 +931,11 @@ mod session_metadata_tests {
 
         assert!(result.is_ok());
         let lookup = result.unwrap();
-        assert_eq!(lookup.entries.len(), 2, "Should return 2 sessions for project-a");
+        assert_eq!(
+            lookup.entries.len(),
+            2,
+            "Should return 2 sessions for project-a"
+        );
 
         for session in &lookup.entries {
             assert_eq!(session.project_path, "/project-a");
